@@ -14,17 +14,19 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from scipy.signal import find_peaks
 import pandas as pd
+import itertools, random
+
 
 gt_csv_path = (
     r"C:\Workspace\Post_Doc_Works_NTNU"
     r"\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-    r"\3_Codes\Python\Dataset_Python\Data Annotation\Sub_3267_325_gt_metrics.csv"
+    r"\3_Codes\Python\Dataset_Python\Sub_3199_316_gt_metrics.csv"
 )
 
 # ----------------------------------------
 # Simulation settings (hard-coded)
 # ----------------------------------------
-bpm       = 65         # heart rate [beats/min], to be changed for each subject
+bpm       = 65.2         # heart rate [beats/min], to be changed for each subject
 cycles    = 20           # number of cardiac cycles to simulate, fixed
 P_ao0     = 70           # initial aortic pressure [mmHg], fixed
 V_LV0     = 100.0        # initial LV volume [ml], fixed
@@ -39,29 +41,56 @@ n2        = 21.9         # double-hill time-varying elastance shape function ter
 use_cycle = 'second_last'       # which cycle to extract: 'last' or 'second_last'
 
 # ----------------------------------------
-# Model base parameters
+# Model base parameters, initial guess
 # ----------------------------------------
 params = {
-    'R_mv':   0.05,   # mitral valve resistance (mmHg·s/ml)
-    'R_sys':  2.67,   # systemic resistance
-    'Z_ao':   0.081,  # aortic impedance
-    'C_sa':   0.45,   # arterial compliance (ml/mmHg)
-    'C_sv':   15,   # venous compliance (ml/mmHg)
-    'E_max':  5,   # max elastance (mmHg/ml)
-    'E_min':  0.05,  # min elastance (mmHg/ml)
-    't_peak': 0.35,  # time to peak elastance (s)
-    'V_tot': 300  # total blood volume (ml)
+    'R_mv':   0.07,    # mitral valve resistance (mmHg·s/ml)
+    'R_sys':  1.93,    # systemic resistance (mmHg·s/ml)
+    'Z_ao':   0.053,   # aortic impedance (mmHg·s/ml)
+    'C_sa':   0.96,    # arterial compliance (ml/mmHg)
+    'C_sv':   21.0,    # venous compliance (ml/mmHg)
+    'E_max':  3.66,    # max elastance (mmHg/ml)
+    'E_min':  0.055,   # min elastance (mmHg/ml)
+    't_peak': 0.4,     # time to peak elastance [s]
+    'V_tot':  300      # total blood volume [ml]
 }
+
+
+# ----------------------------------------
+# Define discrete parameter grid
+# ----------------------------------------
+def define_parameter_grid(params, fixed_specs, other_specs):
+    """
+    fixed_specs: dict param->step (bounds ±5% around base)
+    other_specs: dict param->(low,high,step)
+    returns dict param->np.ndarray
+    """
+    grid = {}
+    # fixed parameters ±5%
+    for k, step in fixed_specs.items():
+        base = params[k]
+        low  = base * 0.90 # for 10% bound, use 0.95 for 5% bound
+        high = base * 1.1  # for 10% bound, use 1.05 for 5% bound
+        grid[k] = np.arange(low, high + step, step)
+    # other parameters custom ranges
+    for k, (low, high, step) in other_specs.items():
+        grid[k] = np.arange(low, high + step, step)
+    return grid
 
 # ----------------------------------------
 # Elastance function
 # ----------------------------------------
 def elastance(t, p):
-    tn = np.mod(t, p['T']) / p['t_peak']
+    T       = p['T']
+    # time normalized to t_peak
+    tn      = np.mod(t, T) / p['t_peak']
+    # apply time scales
     t1 = tn / alpha1
     t2 = tn / alpha2
-    En = (t1 ** n1) / (1 + t1 ** n1)
-    En *= 1.0 / (1 + t2 ** n2)
+    # activation
+    En = (t1**n1) / (1 + t1**n1)
+    En *= 1.0 / (1 + t2**n2)
+    # elastance
     return p['E_max'] * En * a + p['E_min']
 
 # ----------------------------------------
@@ -122,7 +151,6 @@ def cycle_cutting_algo(t, bpm, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao):
         'Q_sv': Q_sv_lv[start:end],
         'Q_ao': Q_lv_ao[start:end]
     }
-
 # ----------------------------------------
 # Extract cycle metrics
 # ----------------------------------------
@@ -260,30 +288,10 @@ def loss_all_matrices(mets, cyc, gt_path, weights, ppa=1.1):
         sse += w * ((s_val - gt_val)/gt_val)**2
     return sse
 
-# ----------------------------------------
-# Main entry
-# ----------------------------------------
-if __name__ == '__main__':
-    # timing
-    T = 60.0 / bpm           # time period of the cardiac cycle from bpm
-    total = cycles * T       # total cardiac cycles for the simulation
-    dt = T / 500.0           # sampling frequency of 500 Hz, dt = 2 ms
-
-    # update params
-    params['T'] = T          # T is added as the 10th model parameter
-
-    # initial conditions
-    V_sa0 = P_ao0 * params['C_sa']
-    V_sv0 = params['V_tot'] - V_LV0 - V_sa0
-    y0 = [V_LV0, V_sa0, V_sv0]
-
-    # run sim
-    t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = run_simulation(params, total, dt, y0)
-
+def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     # plot elastance
     E_full = elastance(t, params)
-    plt.figure()
-    plt.plot(t, E_full)
+    plt.figure(); plt.plot(t, E_full)
     plt.title('Time-Varying Elastance (All Cycles)')
     plt.xlabel('Time [s]'); plt.ylabel('Elastance [mmHg/ml]'); plt.grid()
 
@@ -313,26 +321,98 @@ if __name__ == '__main__':
     plt.title('Pressure-Volume Loop')
     plt.xlabel('V_lv [ml]'); plt.ylabel('P_lv [mmHg]'); plt.grid()
 
-    # extract and plot metrics on cycle
+
+# ----------------------------------------
+# Main entry
+# ----------------------------------------
+if __name__ == '__main__':
+    # timing
+    T = 60.0 / bpm           # time period of the cardiac cycle from bpm
+    total = cycles * T       # total cardiac cycles for the simulation
+    dt = T / 500.0           # sampling frequency of 500 Hz, dt = 2 ms
+
+    # update params
+    params['T'] = T          # T is added as the 10th model parameter
+
+    # initial conditions
+    V_sa0 = P_ao0 * params['C_sa']
+    V_sv0 = params['V_tot'] - V_LV0 - V_sa0
+    y0 = [V_LV0, V_sa0, V_sv0]
+    orig_params = params.copy()
+
+    fixed_specs = {'R_sys': 0.05, 'Z_ao': 0.01, 'C_sa': 0.05}
+    other_specs = {
+        'R_mv': (0.01, 0.1, 0.01),
+        'E_max': (1.0, 5.5, 0.5),
+        'E_min': (0.01, 1.0, 0.1),
+        't_peak': (0.15, 0.6, 0.05),
+        'V_tot': (100, 2500, 250),
+        'C_sv': (1, 30.0, 2.5)
+    }
+    grid = define_parameter_grid(params, fixed_specs, other_specs) # Build your parameter grid once
+    print("OK Here, Flag 1")
+    keys = list(grid.keys()) # Flatten to a list of cases
+    test_cases = []
+    for _ in range(5):
+        # for each key, choose one random value from its array
+        case_vals = [random.choice(grid[k]) for k in keys]
+        test_cases.append(tuple(case_vals))
+    #all_cases = list(itertools.product(*(grid[k] for k in keys))) # Flatten to a list of cases
+    #test_cases = all_cases[:5] # test_cases = random.sample(all_cases, 5) or all_cases[:5]
+    print("OK Here, Flag 2")
+    count = 0
+
+    for cases in test_cases:
+        for k, v in zip(keys, cases):
+            params[k] = v # update params
+        t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = run_simulation(params, total, dt, y0) # run sim
+
+        basic_plots(t, params, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys) #Plost all the basic plots
+
+        cyc = cycle_cutting_algo(t,bpm, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
+        mets, idxs = extract_cycle_metrics(cyc) # extract metrics on cycle
+        plot_cycle_with_metrics(cyc, mets, idxs) # plot metrics on cycle
+        count = count + 1
+
+        print("Running", len(test_cases), "test cases…\n")
+        print("Case: ", count)
+        compare_with_gt(mets, cyc, gt_csv_path) # compare with GT
+
+        weights = {
+            'EDV': 0.5, 'ESV': 0.5, 'SV': 0.5, 'EF': 0.5,
+            'bSBP': 1.5, 'bDBP': 1.5, 'bMAP': 1.5, 'bPP': 1.5,
+            'LVOT_Flow_Peak': 1.0, 'time_LVOT_Flow_Peak': 1.0, 'ED': 0.5,
+            'LVEDP': 0.0
+        } # define weights for loss
+
+        loss = loss_all_matrices(mets, cyc, gt_csv_path, weights)
+        print(f"Weighted SSE loss (excluding LVEDP): {loss:.3f}")
+        print("...................................................\n")
+        plt.show() # One figure per test case, shown immediately
+    #end for
+    params = orig_params.copy()
+    t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = run_simulation(params, total, dt, y0)  # run sim
+
+    basic_plots(t, params, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys)  # Plost all the basic plots
+
     cyc = cycle_cutting_algo(t,bpm, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
-    mets, idxs = extract_cycle_metrics(cyc)
-    plot_cycle_with_metrics(cyc, mets, idxs)
+    mets, idxs = extract_cycle_metrics(cyc)  # extract metrics on cycle
+    plot_cycle_with_metrics(cyc, mets, idxs)  # plot metrics on cycle
+    print(".....Baseline Case....\n")
+    compare_with_gt(mets, cyc, gt_csv_path)  # compare with GT
 
-
-    # print and compare
-    print("Cycle Metrics:")
-    for k, v in mets.items(): print(f"{k}: {v:.3f}")
-    compare_with_gt(mets, cyc, gt_csv_path)
-    # define weights for loss (example)
     weights = {
         'EDV': 0.5, 'ESV': 0.5, 'SV': 0.5, 'EF': 0.5,
         'bSBP': 1.5, 'bDBP': 1.5, 'bMAP': 1.5, 'bPP': 1.5,
         'LVOT_Flow_Peak': 1.0, 'time_LVOT_Flow_Peak': 1.0, 'ED': 0.5,
         'LVEDP': 0.0
-    }
+    }  # define weights for loss
+
     loss = loss_all_matrices(mets, cyc, gt_csv_path, weights)
     print(f"Weighted SSE loss (excluding LVEDP): {loss:.3f}")
+
     plt.show()
+#end main
 
 
 
