@@ -1,0 +1,8 @@
+Saving the Py environment file
+1. Open Anaconda Prompt
+2. It open in base env, switch to the custom environment
+3. conda activate pyenv_0D_DL
+4. Move to the working folder: cd C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Lumped_Parameter_Model_Digital_Twin 
+5. conda env export --no-builds > environment.yml
+---------------------------------------------------------
+
