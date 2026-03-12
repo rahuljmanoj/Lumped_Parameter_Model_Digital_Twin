@@ -1,7 +1,7 @@
 """
-lumped_model_multiple_params_optimise_V1.py+
+lumped_model_multiple_params_optimise_V2.py
 
-method='L-BFGS-B' for Optimization
+method=Differential Evolution followed by L-BFGS-B for Optimization
 
 Standalone script:
 - Hard-coded model & IC parameters
@@ -20,43 +20,99 @@ from scipy.signal import find_peaks
 import pandas as pd
 import itertools, random
 from scipy.optimize import minimize
+from scipy.optimize import differential_evolution
 import time
+import os
+from multiprocessing import cpu_count
 
+sub_id = 365                                                       # *** change here for each subject ***
 gt_csv_path = (
     r"C:\Workspace\Post_Doc_Works_NTNU"
     r"\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-    r"\3_Codes\Python\Dataset_Python\Sub_3199_316_gt_metrics.csv"
+    r"\3_Codes\Python\Dataset_Python\Sub_263_365_gt_metrics.csv"     # *** change here for each subject ***
 )
+gt_df = pd.read_csv(gt_csv_path)
+gt = dict(zip(gt_df['Metric'], gt_df['Value']))
 
 # ----------------------------------------
-# Simulation settings (hard-coded)
+# Simulation settings
 # ----------------------------------------
-bpm       = 65.2         # heart rate [beats/min], to be changed for each subject
-cycles    = 20           # number of cardiac cycles to simulate, fixed
-P_ao0     = 70           # initial aortic pressure [mmHg], fixed
-V_LV0     = 100.0        # initial LV volume [ml], fixed
-P_th      = -4.0         # intrathoracic pressure [mmHg], fixed
+bpm       = gt['HR']         # heart rate [beats/min], to be changed for each subject
+cycles    = 10               # number of cardiac cycles to simulate, fixed
+P_ao0     = 70               # initial aortic pressure [mmHg], fixed
+V_LV0     = 100.0            # initial LV volume [ml], fixed
+P_th      = -4.0             # intrathoracic pressure [mmHg], fixed
 
-a         = 1.55         # double-hill time-varying elastance shape function scaling factor, fixed
-alpha1    = 0.7          # double-hill time-varying elastance shape function time-scale α₁, fixed
-alpha2    = 1.17         # double-hill time-varying elastance shape function time-scale α₂, fixed
-n1        = 1.9          # double-hill time-varying elastance shape function term 1 power, fixed
-n2        = 21.9         # double-hill time-varying elastance shape function term 2 power, fixed
+a         = 1.55             # double-hill time-varying elastance shape function scaling factor, fixed
+alpha1    = 0.7              # double-hill time-varying elastance shape function time-scale α₁, fixed
+alpha2    = 1.17             # double-hill time-varying elastance shape function time-scale α₂, fixed
+n1        = 1.9              # double-hill time-varying elastance shape function term 1 power, fixed
+n2        = 21.9             # double-hill time-varying elastance shape function term 2 power, fixed
 
+SWE_velocity = gt['SWE_vel_MVC']
+soft_weight = 0.25
+phys_weight = 5
 # ----------------------------------------
 # Model base parameters, initial guess
 # ----------------------------------------
 params = {
-    'R_mv':   0.05,#0.07    # mitral valve resistance (mmHg·s/ml)
-    'R_sys':  1.93,    # systemic resistance (mmHg·s/ml)
-    'Z_ao':   0.053,   # aortic impedance (mmHg·s/ml)
-    'C_sa':   0.96,    # arterial compliance (ml/mmHg)
-    'C_sv':   15, #21    # venous compliance (ml/mmHg)
-    'E_max':  5, #3.66,    # max elastance (mmHg/ml)
-    'E_min':  0.055,   # min elastance (mmHg/ml)
-    't_peak': 0.35, #0.4,     # time to peak elastance [s]
-    'V_tot':  300 #300      # total blood volume [ml]
+    'R_mv':   0.05,           # mitral valve resistance (mmHg·s/ml)
+    'R_sys':  gt['R_sys'],    # systemic resistance (mmHg·s/ml)
+    'Z_ao':   gt['Z_ao'],     # aortic impedance (mmHg·s/ml)
+    'C_sa':   gt['C_sa'],     # arterial compliance (ml/mmHg)
+    'C_sv':   15,             # venous compliance (ml/mmHg)
+    'E_max':  5,              # max elastance (mmHg/ml)
+    'E_min':  0.055,          # min elastance (mmHg/ml)
+    't_peak': 0.35,           # time to peak elastance [s]
+    'V_tot':  300             # total blood volume [ml]
 }
+
+# timing
+T = 60.0 / bpm      # time period of the cardiac cycle from bpm
+total = cycles * T  # total cardiac cycles for the simulation
+dt = T / 500.0      # sampling frequency of 500 Hz, dt = 2 ms
+
+# update params
+params['T'] = T     # T is added as the 10th model parameter
+
+# initial conditions
+V_sa0 = P_ao0 * params['C_sa']
+V_sv0 = params['V_tot'] - V_LV0 - V_sa0
+y0 = [V_LV0, V_sa0, V_sv0]
+
+# —– define your metric weights once —–
+weights = {
+    'EDV': 1, 'ESV': 1, 'SV': 1, 'EF': 1,
+    'bSBP': 1, 'bDBP': 1, 'bMAP': 1, 'bPP': 1,
+    'LVOT_Flow_Peak': 1, 'time_LVOT_Flow_Peak': 1, 'ED': 1,
+    'LVEDP': 0.0
+}
+
+# build bounds list exactly as you do for minimize:
+param_names = ['R_sys', 'Z_ao', 'C_sa', 'R_mv', 'E_max', 'E_min', 't_peak', 'V_tot', 'C_sv']
+bounds = [
+    (params['R_sys'] * (1 - 0.20), params['R_sys'] * (1 + 0.20)),  # ±20% fixed
+    (params['Z_ao'] * (1 - 0.20), params['Z_ao'] * (1 + 0.20)),
+    (params['C_sa'] * (1 - 0.20), params['C_sa'] * (1 + 0.20)),
+    (0.01, 0.1),   # R_mv
+    (0.9, 10.0),  # E_max
+    (0.01, 1.0),   # E_min
+    (0.1, 0.7),   # t_peak
+    (50.0, 2000), # V_tot
+    (0.5, 30.0)   # C_sv
+]
+
+# wrap your objective so it only takes theta
+def obj_theta(theta):
+    # unpack into params
+    for name, val in zip(param_names, theta):
+        params[name] = val
+    # rerun sim→cut→metrics→loss
+    t, P_ao, P_lv, V_lv, Q_sv, Q_ao, Q_sys = run_simulation(params, total, dt, y0)
+    cyc = cycle_cutting_algo(t, bpm, P_ao, P_lv, V_lv, Q_sv, Q_ao)
+    mets, _ = extract_cycle_metrics(cyc)
+    return loss_all_matrices(mets, cyc, gt_csv_path, weights)
+
 
 def timeit(fn):
     """Decorator that prints how long a call to fn takes."""
@@ -127,7 +183,8 @@ def circulation_odes(t, y, p):
 # Simulation runner
 # ----------------------------------------
 def run_simulation(params, total_time, dt, y0):
-    t_eval = np.arange(0, total_time + dt, dt)
+    num_steps = int(np.round(total_time / dt))
+    t_eval = np.linspace(0, total_time, num_steps + 1)
     sol = solve_ivp(lambda tt, yy: circulation_odes(tt, yy, params),
                     [0, total_time], y0,
                     t_eval=t_eval, max_step=dt)
@@ -232,12 +289,12 @@ def plot_cycle_with_metrics(cyc, mets, idxs):
     t_edv = t_c[idxs['EDV_idx']]
     v_edv = mets['EDV']
     plt.scatter([t_edv], [v_edv], c='r', marker='o', label='EDV')
-    plt.title('Cycle LV Volume'); plt.xlabel('s'); plt.ylabel('ml'); plt.legend(); plt.grid()
+    plt.title('LV Volume'); plt.xlabel('Time [s]'); plt.ylabel('Volume [ml]'); plt.legend(); plt.grid()
     # PV loop: mark EDV point
     plt.figure()
     plt.plot(cyc['V_lv'], cyc['P_lv'])
     plt.scatter([mets['EDV']], [mets['LVEDP']], c='r', marker='o', label='EDV point')
-    plt.title('Cycle PV Loop'); plt.xlabel('V_lv'); plt.ylabel('P_lv'); plt.legend(); plt.grid()
+    plt.title('LV PV Loop'); plt.xlabel('Volume [ml]'); plt.ylabel('Pressure [mmHg]'); plt.legend(); plt.grid()
 
 # ----------------------------------------
 # Compare with ground-truth CSV
@@ -301,6 +358,16 @@ def loss_all_matrices(mets, cyc, gt_path, weights, ppa=1.1):
         s_val = sim.get(key, np.nan)
         gt_val = gt.get(key, np.nan)
         sse += w * ((s_val - gt_val)/gt_val)**2
+
+    # 2. Soft prior from SWE regression
+    LVEDP_pred = 2.4033 * SWE_velocity + 6.3966
+    LVEDP_sim = mets['LVEDP']
+    sse += soft_weight * ((LVEDP_sim - LVEDP_pred) ** 2 / LVEDP_pred ** 2)
+
+    # Penalize non-physiological LVEDP
+    LVEDP_sim = mets['LVEDP']
+    if LVEDP_sim < 4 or LVEDP_sim > 35:  # use the physiological range you consider
+        sse += phys_weight * ((LVEDP_sim - 16) ** 2 / 16 ** 2)  # center penalty at mid-range (16 mmHg)
     return sse
 
 def objective(theta):
@@ -321,11 +388,48 @@ def objective(theta):
     # 3) compute and return loss
     return loss_all_matrices(mets, cyc, gt_csv_path, weights)
 
+
+# ----------------------------------------
+# Global search + local polish
+# ----------------------------------------
+def global_then_local(bounds, objective):
+    # 1) Global DE
+    t0 = time.perf_counter()
+    print("Starting DifferentialEvolution…")
+    result_de = differential_evolution(
+        func=objective,
+        bounds=bounds,
+        workers=cpu_count(),  # spawn one evaluation per logical core
+        maxiter=50, # only 50 generations
+        popsize=5,  # population = 5×9 = 45
+        tol=1e-4,
+        disp=True
+    )
+    t1 = time.perf_counter()
+    print(f"✓ DE complete in {t1-t0:.1f}s, best loss {result_de.fun:.6f}")
+
+    # 2) Local L-BFGS-B
+    print(" Polishing with L-BFGS-B…")
+    t2 = time.perf_counter()
+    res_local = minimize(
+        fun=objective,
+        x0=result_de.x,
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'ftol':1e-4, 'maxiter':200, 'disp':False}
+    )
+    print(f"✓ DE done: gens={result_de.nit}, evals={result_de.nfev}, best loss={result_de.fun:.6f}")
+    t3 = time.perf_counter()
+    print(f"✓ L-BFGS-B complete in {t3-t2:.1f}s, final loss {res_local.fun:.6f}")
+
+    print(f"Total optimization time: {t3-t0:.1f}s")
+    return res_local
+
 def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     # plot elastance
     E_full = elastance(t, params)
     plt.figure(); plt.plot(t, E_full)
-    plt.title('Time-Varying Elastance (All Cycles)')
+    plt.title('Time-Varying Elastance')
     plt.xlabel('Time [s]'); plt.ylabel('Elastance [mmHg/ml]'); plt.grid()
 
     # plot pressures
@@ -333,7 +437,7 @@ def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     plt.plot(t, P_ao, label='Aortic P')
     plt.plot(t, P_lv, label='LV P')
     plt.title('Pressure Waveforms')
-    plt.xlabel('Time [s]'); plt.ylabel('mmHg'); plt.legend(); plt.grid()
+    plt.xlabel('Time [s]'); plt.ylabel('Pressure [mmHg]'); plt.legend(); plt.grid()
 
     # plot flows
     plt.figure()
@@ -341,103 +445,55 @@ def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     plt.plot(t, Q_sv_lv, label='Mitral Flow')
     plt.plot(t, Q_sys, label='Sys Flow')
     plt.title('Flow Waveforms')
-    plt.xlabel('Time [s]'); plt.ylabel('ml/s'); plt.legend(); plt.grid()
+    plt.xlabel('Time [s]'); plt.ylabel('Flow Rate [ml/s]'); plt.legend(); plt.grid()
 
     # LV volume
     plt.figure()
     plt.plot(t, V_lv, label='LV Volume')
     plt.title('LV Volume')
-    plt.xlabel('Time [s]'); plt.ylabel('ml'); plt.legend(); plt.grid()
+    plt.xlabel('Time [s]'); plt.ylabel('Volume [ml]'); plt.legend(); plt.grid()
 
     # PV loop
     plt.figure(); plt.plot(V_lv, P_lv)
-    plt.title('Pressure-Volume Loop')
-    plt.xlabel('V_lv [ml]'); plt.ylabel('P_lv [mmHg]'); plt.grid()
+    plt.title('LV PV Loop')
+    plt.xlabel('Volume [ml]'); plt.ylabel('Pressure [mmHg]'); plt.grid()
+
+def save_current_figures(sub_id, folder_root=r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Dataset_Python\Results_Plots_Study_1"):
+    """
+    Saves all currently open matplotlib figures to a folder named after sub_id.
+    Each plot is saved as PNG with a unique name.
+    """
+    # Create sub-folder for this subject
+    folder = os.path.join(folder_root, str(sub_id))
+    os.makedirs(folder, exist_ok=True)
+    # Loop through all open figures and save
+    for i, fig_num in enumerate(plt.get_fignums(), 1):
+        fig = plt.figure(fig_num)
+        filename = os.path.join(folder, f"fig_{i}.png")
+        fig.savefig(filename, bbox_inches='tight', dpi=300)
+        print(f"Saved: {filename}")
 
 # ----------------------------------------
 # Main entry
 # ----------------------------------------
 if __name__ == '__main__':
-    # timing
-    T = 60.0 / bpm           # time period of the cardiac cycle from bpm
-    total = cycles * T       # total cardiac cycles for the simulation
-    dt = T / 500.0           # sampling frequency of 500 Hz, dt = 2 ms
+    import multiprocessing
+    multiprocessing.freeze_support()  # on Windows, helps with spawned processes
 
-    # update params
-    params['T'] = T          # T is added as the 10th model parameter
+    # run the hybrid optimiser
+    best = global_then_local(bounds, obj_theta)
 
-    # initial conditions
-    V_sa0 = P_ao0 * params['C_sa']
-    V_sv0 = params['V_tot'] - V_LV0 - V_sa0
-    y0 = [V_LV0, V_sa0, V_sv0]
-    orig_params = params.copy()
+    # final best‐fit
+    print("Optimization success:", best.success)
+    print("Best loss:", best.fun)
+    for name, val in zip(param_names, best.x):
+        print(f"  {name:8s} = {val:.4f}")
 
-    fixed_specs = {'R_sys': 0.05, 'Z_ao': 0.05, 'C_sa': 0.05}
-    other_specs = {
-        'R_mv': (0.01, 0.1, 0.01),
-        'E_max': (1.0, 5.5, 0.5),
-        'E_min': (0.01, 1.0, 0.1),
-        't_peak': (0.15, 0.6, 0.05),
-        'V_tot': (100, 2500, 250),
-        'C_sv': (1, 30.0, 2.5)
-    }
-    grid = define_parameter_grid(params, fixed_specs, other_specs) # Build your parameter grid once
-    # —– set up which parameters to fit —–
-    param_names = [
-      'R_sys','Z_ao','C_sa',   # your “fixed” trio
-      'R_mv','E_max','E_min',
-      't_peak','V_tot','C_sv'
-    ]
-    # —– build continuous bounds for each —–
-    bounds = []
-    for k in param_names:
-        if k in fixed_specs:
-            # ±fixed_specs[k] around base
-            lo = orig_params[k] * (1.0 - fixed_specs[k])
-            hi = orig_params[k] * (1.0 + fixed_specs[k])
-        else:
-            # use the low/high from other_specs[k]
-            lo, hi, _ = other_specs[k]
-        bounds.append((lo, hi))
-
-    # —– initial guess vector —–
-    x0 = [orig_params[k] for k in param_names]
-
-    # —– define your metric weights once —–
-    weights = {
-        'EDV': 1, 'ESV': 1, 'SV': 1, 'EF': 1,
-        'bSBP': 1.5, 'bDBP': 1.5, 'bMAP': 1.5, 'bPP': 1.5,
-        'LVOT_Flow_Peak': 1.5, 'time_LVOT_Flow_Peak': 1.5, 'ED': 0.5,
-        'LVEDP': 0.0
-    }
-    # —– run the optimizer —–
-    print("Starting gradient‐based optimization…")
-    t0_opt = time.perf_counter()
-    res = minimize(
-        fun=objective,
-        x0=x0,
-        method='L-BFGS-B',
-        bounds=bounds,
-        options={'ftol': 1e-4, 'maxiter': 500,'disp':False}
-    )
-    print(" Converged? ", res.success, res.message)
-    print(" Reported res.fun    =", res.fun)
-    true_loss = objective(res.x)
-    print(" Re-evaluated loss   =", true_loss)
-    t1_opt = time.perf_counter()
-    print(f"Optimization completed in {t1_opt - t0_opt:.2f} s")
-
-    # —– unpack fitted values back into params —–
-    for name, val in zip(param_names, res.x):
+    # --- after best = global_then_local(bounds, obj_theta) ---
+    print("\nRe-running simulation with best‐fit parameters…")
+    # 1) Unpack best.x back into params
+    for name, val in zip(param_names, best.x):
         params[name] = val
-
-    print("Fitted parameters:")
-    for name in param_names:
-        print(f"  {name} = {params[name]:.4f}")
-
-    print("After unpacking into params, objective(theta) again:",
-          objective([params[k] for k in param_names]))
-    original_run_sim = run_simulation
 
     # re‐simulate with fitted params
     t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = run_simulation(params, total, dt, y0)  # run sim
@@ -452,8 +508,8 @@ if __name__ == '__main__':
     loss = loss_all_matrices(mets, cyc, gt_csv_path, weights)
     print(f"Weighted SSE loss (excluding LVEDP): {loss:.3f}")
 
-    plt.show()
+    save_current_figures(sub_id)
+    plt.close('all')  # Closes all figures after saving
+    #plt.show()
 #end main
-
-
 
