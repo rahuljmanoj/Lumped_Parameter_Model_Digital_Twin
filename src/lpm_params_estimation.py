@@ -1,8 +1,8 @@
 """
-lumped_model_multiple_params_optimise_V2.py
+lumped_model_multiple_params_optimise_V3.py
 
 method=Differential Evolution followed by L-BFGS-B for Optimization
-
+Automatic Analysis across all the subjects - this version works for 1 subject
 Standalone script:
 - Hard-coded model & IC parameters
 - Simulate a 0D cardiovascular model over multiple cycles
@@ -16,28 +16,35 @@ Standalone script:
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from scipy.signal import find_peaks
 import pandas as pd
-import itertools, random
 from scipy.optimize import minimize
 from scipy.optimize import differential_evolution
 import time
 import os
 from multiprocessing import cpu_count
 
+# Load the combined CSV file (update the path as needed)
+combined_df = pd.read_csv(r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
+                          r"\3_Codes\Python\Dataset_Python\Invasive_Study_Leuven_GT_matrices.csv")
+
 sub_id = 365                                                       # *** change here for each subject ***
-gt_csv_path = (
-    r"C:\Workspace\Post_Doc_Works_NTNU"
-    r"\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-    r"\3_Codes\Python\Dataset_Python\Sub_263_365_gt_metrics.csv"     # *** change here for each subject ***
-)
-gt_df = pd.read_csv(gt_csv_path)
-gt = dict(zip(gt_df['Metric'], gt_df['Value']))
+np.random.seed(sub_id)
+
+# Select the row corresponding to the current sub_id
+data_row = combined_df.loc[combined_df['sub_id'] == sub_id].squeeze()
+
+EDV = data_row['EDV']
+ESV = data_row['ESV']
+R_sys = data_row['R_sys']
+Z_ao = data_row['Z_ao']
+C_sa = data_row['C_sa']
+HR = data_row['HR']
+SWE_vel_MVC = data_row['SWE_vel_MVC']
 
 # ----------------------------------------
 # Simulation settings
 # ----------------------------------------
-bpm       = gt['HR']         # heart rate [beats/min], to be changed for each subject
+bpm       = data_row['HR']        # heart rate [beats/min], to be changed for each subject
 cycles    = 10               # number of cardiac cycles to simulate, fixed
 P_ao0     = 70               # initial aortic pressure [mmHg], fixed
 V_LV0     = 100.0            # initial LV volume [ml], fixed
@@ -49,7 +56,7 @@ alpha2    = 1.17             # double-hill time-varying elastance shape function
 n1        = 1.9              # double-hill time-varying elastance shape function term 1 power, fixed
 n2        = 21.9             # double-hill time-varying elastance shape function term 2 power, fixed
 
-SWE_velocity = gt['SWE_vel_MVC']
+SWE_velocity = data_row['SWE_vel_MVC']
 soft_weight = 0.25
 phys_weight = 5
 # ----------------------------------------
@@ -57,9 +64,9 @@ phys_weight = 5
 # ----------------------------------------
 params = {
     'R_mv':   0.05,           # mitral valve resistance (mmHg·s/ml)
-    'R_sys':  gt['R_sys'],    # systemic resistance (mmHg·s/ml)
-    'Z_ao':   gt['Z_ao'],     # aortic impedance (mmHg·s/ml)
-    'C_sa':   gt['C_sa'],     # arterial compliance (ml/mmHg)
+    'R_sys':  data_row['R_sys'],    # systemic resistance (mmHg·s/ml)
+    'Z_ao':   data_row['Z_ao'],     # aortic impedance (mmHg·s/ml)
+    'C_sa':   data_row['C_sa'],     # arterial compliance (ml/mmHg)
     'C_sv':   15,             # venous compliance (ml/mmHg)
     'E_max':  5,              # max elastance (mmHg/ml)
     'E_min':  0.055,          # min elastance (mmHg/ml)
@@ -111,7 +118,7 @@ def obj_theta(theta):
     t, P_ao, P_lv, V_lv, Q_sv, Q_ao, Q_sys = run_simulation(params, total, dt, y0)
     cyc = cycle_cutting_algo(t, bpm, P_ao, P_lv, V_lv, Q_sv, Q_ao)
     mets, _ = extract_cycle_metrics(cyc)
-    return loss_all_matrices(mets, cyc, gt_csv_path, weights)
+    return loss_all_matrices(mets, cyc, combined_df, sub_id, weights)
 
 
 def timeit(fn):
@@ -299,9 +306,9 @@ def plot_cycle_with_metrics(cyc, mets, idxs):
 # ----------------------------------------
 # Compare with ground-truth CSV
 # ----------------------------------------
-def compare_with_gt(mets, cyc, gt_path, ppa=1.1):
-    gt_df = pd.read_csv(gt_path)
-    gt = dict(zip(gt_df['Metric'], gt_df['Value']))
+def compare_with_gt(mets, cyc, combined_df, sub_id, ppa=1.1):
+    # Extract the row for the current sub_id
+    gt_row = combined_df.loc[combined_df['sub_id'] == sub_id].squeeze()
     sim = {}
     sim['EDV'] = mets['EDV']
     sim['ESV'] = mets['ESV']
@@ -325,17 +332,17 @@ def compare_with_gt(mets, cyc, gt_path, ppa=1.1):
         'ED','LVEDP'
     ]:
         s_val = sim.get(key, np.nan)
-        gt_val = gt.get(key, np.nan)
+        gt_val =  gt_row.get(key, np.nan)
         print(f"{key:>22} | {s_val:10.3f} | {gt_val:10.3f}")
+    return sim
 
 
 # ----------------------------------------
 # Compute weighted SSE loss (excluding LVEDP)
 # ----------------------------------------
-def loss_all_matrices(mets, cyc, gt_path, weights, ppa=1.1):
-    # load ground-truth
-    gt_df = pd.read_csv(gt_path)
-    gt = dict(zip(gt_df['Metric'], gt_df['Value']))
+def loss_all_matrices(mets, cyc, combined_df, sub_id, weights, ppa=1.1):
+    # Extract the row for the current sub_id
+    gt_row = combined_df.loc[combined_df['sub_id'] == sub_id].squeeze()
     # assemble sim metrics
     sim = {
         'EDV': mets['EDV'],
@@ -356,7 +363,7 @@ def loss_all_matrices(mets, cyc, gt_path, weights, ppa=1.1):
         if key == 'LVEDP':
             continue
         s_val = sim.get(key, np.nan)
-        gt_val = gt.get(key, np.nan)
+        gt_val =  gt_row.get(key, np.nan)
         sse += w * ((s_val - gt_val)/gt_val)**2
 
     # 2. Soft prior from SWE regression
@@ -386,7 +393,7 @@ def objective(theta):
     mets, _  = extract_cycle_metrics(cyc)
 
     # 3) compute and return loss
-    return loss_all_matrices(mets, cyc, gt_csv_path, weights)
+    return loss_all_matrices(mets, cyc, combined_df, sub_id, weights)
 
 
 # ----------------------------------------
@@ -423,7 +430,7 @@ def global_then_local(bounds, objective):
     print(f"✓ L-BFGS-B complete in {t3-t2:.1f}s, final loss {res_local.fun:.6f}")
 
     print(f"Total optimization time: {t3-t0:.1f}s")
-    return res_local
+    return res_local, t3-t0
 
 def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     # plot elastance
@@ -458,7 +465,7 @@ def basic_plots(t, params,P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys):
     plt.title('LV PV Loop')
     plt.xlabel('Volume [ml]'); plt.ylabel('Pressure [mmHg]'); plt.grid()
 
-def save_current_figures(sub_id, folder_root=r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Dataset_Python\Results_Plots_Study_1"):
+def save_current_figures(sub_id, folder_root=r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Dataset_Python\Results_Plots_Study_2"):
     """
     Saves all currently open matplotlib figures to a folder named after sub_id.
     Each plot is saved as PNG with a unique name.
@@ -480,8 +487,10 @@ if __name__ == '__main__':
     import multiprocessing
     multiprocessing.freeze_support()  # on Windows, helps with spawned processes
 
+    sim_results = []
+
     # run the hybrid optimiser
-    best = global_then_local(bounds, obj_theta)
+    best,opt_time = global_then_local(bounds, obj_theta)
 
     # final best‐fit
     print("Optimization success:", best.success)
@@ -503,13 +512,24 @@ if __name__ == '__main__':
     cyc = cycle_cutting_algo(t, bpm, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
     mets, idxs = extract_cycle_metrics(cyc)  # extract metrics on cycle
     plot_cycle_with_metrics(cyc, mets, idxs)  # plot metrics on cycle
-    compare_with_gt(mets, cyc, gt_csv_path)  # compare with GT
+    sim_matrices = compare_with_gt(mets, cyc, combined_df, sub_id)  # compare with GT
 
-    loss = loss_all_matrices(mets, cyc, gt_csv_path, weights)
+    loss = loss_all_matrices(mets, cyc, combined_df, sub_id, weights)
     print(f"Weighted SSE loss (excluding LVEDP): {loss:.3f}")
 
     save_current_figures(sub_id)
     plt.close('all')  # Closes all figures after saving
     #plt.show()
-#end main
 
+    # Collect result row for this subject
+    result_row = {'sub_id': sub_id, 'loss': loss, 'optimization_time_sec': opt_time, 'soft_weight': soft_weight, 'phys_weight': phys_weight}
+    for name, val in zip(param_names, best.x):
+        result_row[name] = val
+    result_row.update(sim_matrices)
+
+    sim_results.append(result_row)
+
+    results_df = pd.DataFrame(sim_results)
+    results_df.to_csv("Study_1_sim_results.csv", index=False)
+
+#end main
