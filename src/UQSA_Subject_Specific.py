@@ -1,111 +1,197 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
-from scipy.optimize import minimize, differential_evolution
-import pandas as pd
+# -*- coding: utf-8 -*-
+"""
+LPM_V4.1_UQSA_AllInOne_10pct_UQdrop_SAkeep.py
+
+Single-file UQ + SA for your 0D cardiovascular model (V4.1):
+ - ED at dp/dt upstroke; ES at max(P/V) within AVO→AVC
+ - Subject-specific ±10% bounds (θ-window) intersected with hard bounds
+ - Sampling in z-space using the window mapped to [z_lo,z_hi] (log/lin safe)
+ - UQ (MC): STRICT -> drop invalid (no replacement)
+ - Sobol (LVEDP): KEEP ALL -> replace invalid with the median of valid Y (to preserve Saltelli structure)
+ - Sobol (VALIDITY): sensitivity of probability(valid), unchanged
+ - Exports V4.1 and legacy filenames
+
+Author: Rahul Manoj (with Copilot assistance)
+"""
+
+# ======== USER SETTINGS ======================================================
+EXCEL_PATH   = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx"
+SHEET_NAME   = "Study_3_V4.1_T6"     # adjust if needed
+#SUBJECT_LIST = [316, 319, 323, 325, 326, 327, 328, 329, 331, 332, 334, 336, 337, 338, 339, 341, 342, 343,
+                #344, 346, 347, 349, 351, 352]
+#SUBJECT_LIST =  [354, 356, 357, 359, 360]
+#SUBJECT_LIST =  [361, 362, 363, 364, 365]
+SUBJECT_LIST =  [366, 367, 368, 369, 370, 371, 372, 382, 383, 385, 386, 387, 388, 389, 390, 391, 392, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 409, 410, 411, 412, 413, 414, 415]                # 999 = mean row; or [316, 319, ...]
+SAVE_ROOT    = r".\Results_all_subjects_UQSA_LPM_4.1"
+
+# Monte-Carlo (UQ)
+N_MC     = 75000          # your requested 75k
+MC_MODE  = "uniform"      # "uniform" in z-window, or "normal" around z_best
+PRIOR_CV = 0.15           # only used if MC_MODE=="normal" (σ in z)
+
+# Sobol (SA)
+SOBOL_BASE_N =2048       # your requested base N
+SOBOL_BOOT   = 2000       # your requested bootstrap resamples for CI
+SECOND_ORDER = False      # can set True if you want S2 (costly)
+
+# Subject-specific ±% windows (θ-space) intersected with hard bounds
+PCT_WINDOW = {
+    "R_sys":0.10, "Z_ao":0.10, "C_sa":0.10, "R_mv":0.10,
+    "E_max":0.10, "E_min":0.10, "t_peak":0.10, "V_tot":0.10, "C_sv":0.10
+}
+# ============================================================================
+
 import os
 import time
+import numpy as np
+import pandas as pd
+
 from multiprocessing import cpu_count
+from joblib import Parallel, delayed
+from scipy.integrate import solve_ivp
+from scipy.optimize import minimize, differential_evolution
+from scipy.stats import qmc, norm
+
 from SALib.sample import sobol as sobol_sample
 from SALib.analyze import sobol as sobol_analyze
-#from scipy.stats import lognorm, beta as beta_dist, qmc
-from scipy.stats import norm, qmc
-from joblib import Parallel, delayed
 
 PHYS_LVEDP_RANGE = (4.0, 35.0)
+EPS_NUM = 1e-12
 
+# --------------------- helpers: formatting & logging -------------------------
+def _sec_to_str(dt):
+    if dt < 60: return f"{dt:.1f}s"
+    m = int(dt // 60); s = dt - 60*m
+    return f"{m:d}m {s:.1f}s"
+
+def _hdr(title):
+    line = "=" * (len(title) + 4)
+    return f"\n{line}\n= {title} =\n{line}"
+
+def _get(row, keys, default=np.nan):
+    """Return first present, non-NaN field from candidate keys in a pandas Series."""
+    if isinstance(keys, str): keys = [keys]
+    for k in keys:
+        if k in row and pd.notna(row[k]): return row[k]
+    return default
+
+# ========================= V4.1 MODEL (SubjectSimulator) =====================
 class SubjectSimulator:
-
-    def __init__(self, data_row, sub_id, save_root, soft_weight=0.75, soft_weight_Emin=1, phys_weight=10):
-        """Initialize all subject-specific and fixed simulation parameters."""
+    def __init__(self, data_row, sub_id, save_root,
+                 soft_weight_LVEDP=10.0, lambda_phys=100.0):
         self.sub_id = sub_id
         self.data_row = data_row
         self.save_root = save_root
-        # Weights for loss function
-        self.soft_weight = soft_weight
-        self.phys_weight = phys_weight
-        self.soft_weight_Emin = soft_weight_Emin
 
-        # Fixed simulation and elastance parameters
+        # weights/penalties
+        self.soft_weight_LVEDP = soft_weight_LVEDP
+        self.lambda_phys = lambda_phys
+
+        # fixed hemodynamics & elastance
         self.cycles = 10
-        self.P_ao0 = 70
+        self.P_ao0 = 70.0
         self.V_LV0 = 100.0
-        self.P_th = -4.0
-
+        self.P_th  = -4.0
         self.a = 1.55
-        self.alpha1 = 0.7
-        self.alpha2 = 1.17
-        self.n1 = 1.9
-        self.n2 = 21.9
+        self.alpha1, self.alpha2 = 0.7, 1.17
+        self.n1, self.n2 = 1.9, 21.9
 
-        self.SWE_velocity = data_row['SWS (m/s)']
-        self.GT_bMAP = data_row['GT bMAP (mmHg)']
-        self.h_r = data_row['h/r']
-        self.LAVI = data_row['LAVI (ml/m²)']
-        self.BSA = data_row['BSA (m²)']
-        self.age = data_row['age (yrs)']
-        self.BMI = data_row['BMI (kg/m²)']
-        self.weight = data_row['weight (kg)']
+        # subject fields
+        self.SWE_velocity      = float(_get(data_row, ['SWE_vel_MVC', 'SWS (m/s)', 'SWE (m/s)'], 2.5))
+        self.bMAP              = float(_get(data_row, ['bMAP', 'GT bMAP (mmHg)'], 90.0))
+        self.Emin_mech_prior   = float(_get(data_row, ['Emin_isotonic_cal', 'E_min (mmHg/ml)'], 0.05))
+        self.bpm               = float(_get(data_row, ['HR', 'HR (bpm)'], 60.0))
 
-
-        self.bpm = data_row['HR (bpm)']
         self.T = 60.0 / self.bpm
         self.total = self.cycles * self.T
         self.dt = self.T / 500.0
 
-        # Model parameter names and initial guess (for bounds)
-        self.param_names = ['R_sys', 'Z_ao', 'C_sa', 'R_mv', 'E_max', 'E_min', 't_peak', 'V_tot', 'C_sv']
+        # paper-aligned ED/ES
+        self.ED_DEF  = "dpdt_upstroke"
+        self.ESP_DEF = "max_P_over_V"
+
+        # parameters (nominal)
+        self.param_names = ['R_sys','Z_ao','C_sa','R_mv','E_max','E_min','t_peak','V_tot','C_sv']
         self.params = {
-            'R_sys': data_row['R_sys (mmHg s/ml)'],
-            'Z_ao': data_row['Z_ao (mmHg s/ml)'],
-            'C_sa': data_row['C_sa (ml/mmHg)'],
-            'R_mv': data_row['R_mv (mmHg s/ml)'],
-            'E_max': data_row['E_max (mmHg/ml)'],
-            'E_min': data_row['E_min (mmHg/ml)'],
-            't_peak': data_row['t_peak (s)'],
-            'V_tot': data_row['V_tot (ml)'],
-            'C_sv': data_row['C_sv (ml/mmHg)'],
+            'R_sys': 2.09, 'Z_ao': 0.06, 'C_sa': 0.68, 'R_mv': 0.05,
+            'E_max': 5.0,  'E_min': 0.05,'t_peak': 0.35,'V_tot': 300.0,'C_sv': 15.0,
             'T': self.T
         }
-        # Bounds for optimization (subject specific)
+
+        # hard bounds
         self.bounds = [
-            (0.5, 3.0),     # R_sys (self.params['R_sys'] * (1 - 0.20), self.params['R_sys'] * (1 + 0.20)),
-            (0.01, 1.0),     # Z_ao  (self.params['Z_ao'] * (1 - 0.20), self.params['Z_ao'] * (1 + 0.20)),
-            (0.5, 10.0),     # C_sa  (self.params['C_sa'] * (1 - 0.20), self.params['C_sa'] * (1 + 0.20)),
-            (0.01, 0.1),     # R_mv
-            (0.9, 10.0),     # E_max
-            (0.01, 2.5),     # E_min #(self.params['E_min'] * (1 - 0.30), self.params['E_min'] * (1 + 0.30)),
-            (0.1, 0.7),      # t_peak
-            (50.0, 2000),    # V_tot
-            (0.5, 30.0)      # C_sv
+            (0.5, 4.0),   (0.01, 1.0), (0.1, 10.0),
+            (0.01, 0.1),  (0.9, 10.0), (0.01, 2.5),
+            (0.1, 0.7),   (50.0, 2000),(0.5, 30.0)
         ]
-        # Initial conditions
+
+        # IC
         V_sa0 = self.P_ao0 * self.params['C_sa']
         V_sv0 = self.params['V_tot'] - self.V_LV0 - V_sa0
         self.y0 = [self.V_LV0, V_sa0, V_sv0]
-        # Metric weights for loss calculation
+
+        # loss scaling
         self.weights = {
-            'EDV': 1, 'ESV': 1, 'SV': 1, 'EF': 1,
-            'bSBP': 1, 'bDBP': 1, 'bMAP': 1, 'bPP': 1,
-            'LVOT_Flow_Peak': 1, 'time_LVOT_Flow_Peak': 1, 'ED': 1,
-            'LVEDP': 0.0
+            'EDV':1, 'ESV':1, 'SV':0, 'EF':0,
+            'bSBP':1, 'bDBP':1, 'bMAP':0, 'bPP':0,
+            'LVOT_Flow_Peak':0, 'time_LVOT_Flow_Peak':0,
+            'ET':1, 'IVRT':1, 'LVEDP':0.0
         }
-        # For saving plots/results
+        self.loss_scaling_mode = 'cohort_minmax'
+
+        # prior for LVEDP
+        self.sigma_prior     = 4.235  # mmHg RMSE
+        self.prior_deadzone  = 3.0    # mmHg
+        self.use_prior_deadzone = True
+        self.kappa_prior     = 1.0
+
         self.subject_dir = os.path.join(self.save_root, str(self.sub_id))
         os.makedirs(self.subject_dir, exist_ok=True)
 
+        self._precompute_bounds_arrays()
+
+    # ---------- V4.1 z<->θ ----------
+    def _precompute_bounds_arrays(self):
+        self.lb = np.array([b[0] for b in self.bounds], float)
+        self.ub = np.array([b[1] for b in self.bounds], float)
+        self.scale_type = ['log','log','log','log','log','log','lin','log','log']
+
+    def z_from_theta(self, theta):
+        theta = np.asarray(theta, float)
+        z = np.empty_like(theta)
+        for i, st in enumerate(self.scale_type):
+            lb, ub = self.lb[i], self.ub[i]
+            if st == 'log':
+                lb = max(lb, EPS_NUM); ub = max(ub, lb*(1+1e-12))
+                z[i] = (np.log(theta[i]) - np.log(lb)) / (np.log(ub) - np.log(lb))
+            else:
+                z[i] = (theta[i] - lb) / (ub - lb)
+        return np.clip(z, 0, 1)
+
+    def theta_from_z(self, z):
+        z = np.asarray(z, float); z = np.clip(z, 0, 1)
+        theta = np.empty_like(z)
+        for i, st in enumerate(self.scale_type):
+            lb, ub = self.lb[i], self.ub[i]
+            if st == 'log':
+                lb = max(lb, EPS_NUM); ub = max(ub, lb*(1+1e-12))
+                logθ = np.log(lb) + z[i]*(np.log(ub)-np.log(lb))
+                theta[i] = np.exp(logθ)
+            else:
+                theta[i] = lb + z[i]*(ub-lb)
+        return theta
+
+    # ---------- model dynamics ----------
     def initial_state(self, p):
         V_sa0 = self.P_ao0 * p['C_sa']
         V_sv0 = p['V_tot'] - self.V_LV0 - V_sa0
         return [self.V_LV0, V_sa0, V_sv0]
 
-    # -- Cardiovascular model and simulation methods --
     def elastance(self, t, p):
         tn = np.mod(t, p['T']) / p['t_peak']
-        t1 = tn / self.alpha1
-        t2 = tn / self.alpha2
-        En = (t1 ** self.n1) / (1 + t1 ** self.n1)
-        En *= 1.0 / (1 + t2 ** self.n2)
+        t1, t2 = tn / self.alpha1, tn / self.alpha2
+        En = (t1**self.n1) / (1 + t1**self.n1)
+        En *= 1.0 / (1 + t2**self.n2)
         return p['E_max'] * En * self.a + p['E_min']
 
     def circulation_odes(self, t, y, p):
@@ -114,23 +200,18 @@ class SubjectSimulator:
         P_lv = E_t * V_lv + self.P_th
         P_sa = V_sa / p['C_sa']
         P_sv = V_sv / p['C_sv']
-        Q_sv_lv = (P_sv - P_lv) / p['R_mv'] if P_sv > P_lv else 0.0
-        Q_lv_ao = (P_lv - P_sa) / p['Z_ao'] if P_lv > P_sa else 0.0
-        Q_sys   = (P_sa - P_sv) / p['R_sys'] if P_sa > P_sv else 0.0
-        return [Q_sv_lv - Q_lv_ao,
-                Q_lv_ao - Q_sys,
-                Q_sys - Q_sv_lv]
+        Q_sv_lv = (P_sv - P_lv)/p['R_mv'] if P_sv > P_lv else 0.0
+        Q_lv_ao = (P_lv - P_sa)/p['Z_ao'] if P_lv > P_sa else 0.0
+        Q_sys   = (P_sa - P_sv)/p['R_sys'] if P_sa > P_sv else 0.0
+        return [Q_sv_lv - Q_lv_ao, Q_lv_ao - Q_sys, Q_sys - Q_sv_lv]
 
     def run_simulation(self, params=None):
-        """Simulate model for a set of parameters."""
-        if params is None:
-            params = self.params
-        y0 = self.initial_state(params)  # <-- use params-consistent ICs
+        if params is None: params = self.params
+        y0 = self.initial_state(params)
         num_steps = int(np.round(self.total / self.dt))
         t_eval = np.linspace(0, self.total, num_steps + 1)
         sol = solve_ivp(lambda tt, yy: self.circulation_odes(tt, yy, params),
-                        [0, self.total], y0,
-                        t_eval=t_eval, max_step=self.dt, rtol=1e-6, atol=1e-8)
+                        [0, self.total], y0, t_eval=t_eval, max_step=self.dt)
         t = sol.t
         V_lv, V_sa, V_sv = sol.y
         P_lv = self.elastance(t, params) * V_lv + self.P_th
@@ -143,717 +224,508 @@ class SubjectSimulator:
         return t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys
 
     def cycle_cutting_algo(self, t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao):
-        """Cut out the last full cardiac cycle from simulation arrays."""
-        dt = t[1] - t[0]
-        T  = 60.0 / self.bpm
-        spc = int(round(float(T / dt)))
-        n   = len(t) // spc
-        if n < 2:
-            raise RuntimeError("Not enough full cycles to slice out")
-        start = (n-2) * spc
-        end   = (n-1) * spc
+        dt = t[1] - t[0]; T = 60.0 / self.bpm
+        spc = int(round(float(T/dt)))
+        n = len(t)//spc
+        if n < 2: raise RuntimeError("Not enough full cycles to slice out")
+        start = (n-2)*spc; end = (n-1)*spc
         return {
-            't':    t[start:end] - t[start],
-            'P_ao': P_ao[start:end],
-            'P_lv': P_lv[start:end],
-            'V_lv': V_lv[start:end],
-            'Q_sv': Q_sv_lv[start:end],
-            'Q_ao': Q_lv_ao[start:end]
+            't': t[start:end]-t[start], 'P_ao':P_ao[start:end], 'P_lv':P_lv[start:end],
+            'V_lv':V_lv[start:end], 'Q_sv':Q_sv_lv[start:end], 'Q_ao':Q_lv_ao[start:end]
         }
+
+    # ---- event detection ----
+    def _cycle_period(self, t):
+        t = np.asarray(t, float); dt = float(t[1]-t[0])
+        return float(t[-1]-t[0]+dt)
+
+    def _dt_cyclic(self, t1, t2, T):
+        return float(t2 - t1) if t2 >= t1 else float(t2 + T - t1)
+
+    def _flow_segments(self, Q, thr_frac=0.01, abs_thr=1e-3, min_len=3):
+        Q = np.asarray(Q, float)
+        if np.max(Q) <= 0: return []
+        thr = max(thr_frac*np.max(Q), abs_thr)
+        mask = Q > thr
+        if not np.any(mask): return []
+        d = np.diff(mask.astype(int))
+        starts = list(np.where(d==1)[0] + 1)
+        ends   = list(np.where(d==-1)[0])
+        if mask[0]:  starts = [0] + starts
+        if mask[-1]: ends   = ends + [len(Q)-1]
+        segs = []
+        for s, e in zip(starts, ends):
+            if e - s + 1 >= min_len: segs.append((int(s), int(e)))
+        return segs
+
+    def _choose_main_segment(self, Q, segs):
+        if not segs: return None, None
+        Q = np.asarray(Q, float)
+        peaks = [np.max(Q[s:e+1]) for s, e in segs]
+        k = int(np.argmax(peaks))
+        return segs[k]
+
+    def _valve_events_from_flows(self, t, Qao, Qmv, thr_ao=0.01, thr_mv=0.005):
+        N = len(t)
+        ao_segs = self._flow_segments(Qao, thr_frac=thr_ao, min_len=3)
+        avo, avc = self._choose_main_segment(Qao, ao_segs)
+        mv_segs = self._flow_segments(Qmv, thr_frac=thr_mv, min_len=3)
+        if not mv_segs: return avo, avc, None, None
+        if avo is None or avc is None:
+            mvo = mv_segs[0][0]; mvc = mv_segs[-1][1]
+            return avo, avc, int(mvo), int(mvc)
+        avo_i, avc_i = int(avo), int(avc)
+        starts = np.array([s for s, e in mv_segs], int)
+        ends   = np.array([e for s, e in mv_segs], int)
+        starts_shift = np.where(starts >= avc_i, starts, starts + N)
+        mvo = int(starts[np.argmin(starts_shift)])
+        ends_shift = np.where(ends <= avo_i, ends, ends - N)
+        mvc = int(ends[np.argmax(ends_shift)])
+        return avo_i, avc_i, mvo, mvc
+
+    def _idx_esp_max_P_over_V(self, P, V, avo=None, avc=None):
+        eps = 1e-6
+        ratio = P/np.maximum(V, eps)
+        if avo is not None and avc is not None:
+            if avc >= avo: idx_range = np.arange(avo, avc+1)
+            else:          idx_range = np.concatenate([np.arange(avo, len(P)), np.arange(0, avc+1)])
+            return int(idx_range[np.argmax(ratio[idx_range])])
+        return int(np.argmax(ratio))
 
     def extract_cycle_metrics(self, cyc):
-        """Extract main cycle metrics from a cut cycle."""
-        t = cyc['t']
-        V = cyc['V_lv']
-        P = cyc['P_lv']
-        Q = cyc['Q_ao']
-        EDV_idx = np.argmax(V)
-        ESV_idx = np.argmin(V)
-        EDV = V[EDV_idx]
-        ESV = V[ESV_idx]
-        LVEDP = P[EDV_idx]
-        peak_idx = np.argmax(Q)
-        Q_peak = Q[peak_idx]
-        t_peak = t[peak_idx]
+        t   = np.asarray(cyc['t'], float)
+        V   = np.asarray(cyc['V_lv'], float)
+        P   = np.asarray(cyc['P_lv'], float)
+        Qao = np.asarray(cyc['Q_ao'], float)
+        Qmv = np.asarray(cyc['Q_sv'], float)
+        Tcyc = self._cycle_period(t)
+
+        avo_i, avc_i, mvo_i, mvc_i = self._valve_events_from_flows(t, Qao, Qmv, 0.01, 0.005)
+
+        dPdt = np.gradient(P, t)
+        if self.ED_DEF == "dpdt_upstroke":
+            if mvc_i is not None:
+                back_s = 0.25; dt = float(t[1]-t[0]); back_n = int(round(back_s/dt))
+                i0 = max(0, int(mvc_i)-back_n); i1 = int(mvc_i)
+                d = dPdt[i0:i1+1]
+                crossings = np.where((d[:-1] <= 0) & (d[1:] > 0))[0] + 1
+                ED_idx = int(i0 + crossings[-1]) if len(crossings) else int(np.argmax(V))
+            else:
+                i_peak = int(np.argmax(dPdt))
+                crossings = np.where((dPdt[:-1] <= 0) & (dPdt[1:] > 0))[0] + 1
+                crossings = crossings[crossings < i_peak]
+                ED_idx = int(crossings[-1]) if len(crossings) else int(np.argmax(V))
+        else:
+            ED_idx = int(np.argmax(V))
+
+        EDV   = float(V[ED_idx])
+        LVEDP = float(P[ED_idx])
+
+        if self.ESP_DEF == "max_P_over_V":
+            es_idx = self._idx_esp_max_P_over_V(P, V, avo_i, avc_i)
+        else:
+            es_idx = int(np.argmin(V))
+        ESP = float(P[es_idx])
+        ESV = float(V[es_idx])
+
+        ESV_minV      = float(np.min(V))
+        ESV_idx_minV  = int(np.argmin(V))
+        EDV_maxV      = float(np.max(V))
+
+        peak_idx = int(np.argmax(Qao))
+        Q_peak   = float(Qao[peak_idx])
+        t_peak   = float(t[peak_idx])
+
         thresh = 0.01 * Q_peak
-        mask = Q > thresh
-        edur_start_idx = np.where(mask)[0][0] if mask.any() else EDV_idx
-        edur_end_idx   = np.where(mask)[0][-1] if mask.any() else EDV_idx
-        EDur = t[edur_end_idx] - t[edur_start_idx]
+        mask   = Qao > thresh
+        edur_start_idx = int(np.where(mask)[0][0]) if mask.any() else ED_idx
+        edur_end_idx   = int(np.where(mask)[0][-1]) if mask.any() else ED_idx
+        EDur = float(t[edur_end_idx] - t[edur_start_idx])
+
+        if avc_i is not None and mvo_i is not None:
+            IVRT = self._dt_cyclic(float(t[avc_i]), float(t[mvo_i]), Tcyc)
+        else:
+            IVRT = np.nan
+
         return (
-            {'EDV': EDV, 'ESV': ESV, 'LVEDP': LVEDP,
-             'Q_peak': Q_peak, 't_peak': t_peak, 'EDur': EDur},
-            {'EDV_idx': EDV_idx, 'ESV_idx': ESV_idx,
-             'peak_idx': peak_idx,
-             'edur_start': edur_start_idx, 'edur_end': edur_end_idx}
+            {
+                'EDV': EDV, 'ESV': ESV, 'ESV_minV': ESV_minV, 'LVEDP': LVEDP,
+                'ESP': ESP, 'EDV_maxV': EDV_maxV,
+                'Q_peak': Q_peak, 't_peak': t_peak, 'EDur': EDur, 'ET': EDur, 'IVRT': IVRT
+            },
+            {
+                'EDV_idx': int(ED_idx), 'ESV_idx': int(es_idx),
+                'ESV_minV_idx': int(ESV_idx_minV), 'peak_idx': int(peak_idx),
+                'edur_start': int(edur_start_idx), 'edur_end': int(edur_end_idx),
+                'avo_idx': avo_i, 'avc_idx': avc_i, 'mvo_idx': mvo_i, 'mvc_idx': mvc_i
+            }
         )
 
-    # -- Loss function used for parameter estimation --
-    def loss_all_matrices(self, theta):
-        """Objective function: computes the weighted SSE loss for a candidate parameter vector."""
-        params = self.params.copy()
-        for name, val in zip(self.param_names, theta):
-            params[name] = val
-        t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = self.run_simulation(params)
-        cyc = self.cycle_cutting_algo(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
-        mets, _ = self.extract_cycle_metrics(cyc)
-        gt = self.data_row  # ground-truth for this subject
+# ------------------------ optional Excel param override -----------------------
+def try_override_params_from_row(sim, data_row):
+    col_map = {
+        "R_sys (mmHg s/ml)": "R_sys", "Z_ao (mmHg s/ml)": "Z_ao", "C_sa (ml/mmHg)": "C_sa",
+        "R_mv (mmHg s/ml)": "R_mv", "E_max (mmHg/ml)": "E_max", "E_min (mmHg/ml)": "E_min",
+        "t_peak (s)": "t_peak", "V_tot (ml)": "V_tot", "C_sv (ml/mmHg)": "C_sv",
+        "Emin_isotonic_cal": "E_min",
+    }
+    updates = 0
+    for src, dst in col_map.items():
+        if src in data_row and pd.notna(data_row[src]):
+            try: sim.params[dst] = float(data_row[src]); updates += 1
+            except: pass
+    if updates>0 and hasattr(sim, "_precompute_bounds_arrays"):
+        sim._precompute_bounds_arrays()
+    return updates
 
-        # Compute the main metrics
-        sim = {
-            'EDV': mets['EDV'],
-            'ESV': mets['ESV'],
-            'SV':  mets['EDV'] - mets['ESV'],
-            'EF':  (mets['EDV'] - mets['ESV'])/mets['EDV']*100 if mets['EDV'] > 0 else np.nan,
-            'bSBP': np.max(cyc['P_ao'])*1.1,
-            'bDBP': np.min(cyc['P_ao'])*1.1,
-            'bMAP': (np.max(cyc['P_ao'])*1.1 + 2*np.min(cyc['P_ao'])*1.1)/3,
-            'bPP':  np.max(cyc['P_ao'])*1.1 - np.min(cyc['P_ao'])*1.1,
-            'LVOT_Flow_Peak': mets['Q_peak'],
-            'time_LVOT_Flow_Peak': mets['t_peak'],
-            'ED': mets['EDur']
-        }
-        sse = 0.0
-        for key, w in self.weights.items():
-            if key == 'LVEDP':
-                continue
-            s_val = sim.get(key, np.nan)
-            gt_val = gt.get(key, np.nan)
-            sse += w * ((s_val - gt_val)/gt_val)**2 if gt_val != 0 else 0.0
+# ==================== subject-specific ±% window (θ) → z-window ===============
+def make_subject_bounds(sim, pct=None):
+    """Intersect hard bounds with a ±pct window around current sim.params."""
+    names = list(sim.param_names)
+    lb_hard = np.asarray(sim.lb, float); ub_hard = np.asarray(sim.ub, float)
+    if pct is None: pct = {n:0.10 for n in names}
+    lb_win = np.empty_like(lb_hard); ub_win = np.empty_like(ub_hard)
+    for i, n in enumerate(names):
+        base = float(sim.params[n]); r = float(pct.get(n, 0.10))
+        lo_w, hi_w = (1-r)*base, (1+r)*base
+        lb_win[i] = max(lb_hard[i], min(lo_w, hi_w))
+        ub_win[i] = min(ub_hard[i], max(lo_w, hi_w))
+    assert np.all(np.isfinite(lb_win)) and np.all(np.isfinite(ub_win)), "Non-finite bounds"
+    assert np.all(lb_win < ub_win), "Lower bound not < upper bound"
+    return names, lb_win, ub_win  # θ-window
 
-        # Soft prior (1) (regression)
-        #LVEDP_pred = 2.4033 * self.SWE_velocity + 6.3966
-        LVEDP_pred = (
-                             2.5645 * self.SWE_velocity + 0.1495 * self.GT_bMAP - 8.7409
-        )
-        LVEDP_sim = mets['LVEDP']
-        sse += self.soft_weight * ((LVEDP_sim - LVEDP_pred) ** 2 / LVEDP_pred ** 2)
+def window_to_z_interval(sim, lb_win, ub_win):
+    """Map θ-window [lb_win, ub_win] into per-dimension z-window [z_lo, z_hi]."""
+    z_lo = sim.z_from_theta(lb_win); z_hi = sim.z_from_theta(ub_win)
+    return np.minimum(z_lo, z_hi), np.maximum(z_lo, z_hi)
 
+def z_best_from_sim(sim):
+    theta_best = np.array([float(sim.params[n]) for n in sim.param_names], float)
+    return sim.z_from_theta(theta_best)
 
-        interval = 0.2  # mmHg/ml
-        Emin_pred = (self.SWE_velocity - 2.489) / 2.5691 #Pig Data before I/R injury
-        Emin_sim = params['E_min']
+def z_to_theta(sim, Z):
+    return np.vstack([sim.theta_from_z(z) for z in Z])
 
-        # Penalty if outside the interval:
-        if Emin_sim < Emin_pred - interval:
-            sse += self.soft_weight_Emin * ((Emin_sim - (Emin_pred - interval)) ** 2) / Emin_pred ** 2
-        elif Emin_sim > Emin_pred + interval:
-            sse += self.soft_weight_Emin * ((Emin_sim - (Emin_pred + interval)) ** 2) / Emin_pred ** 2
-        #else: No penalty if within the interval
+def sample_Z_in_window(N, z_lo, z_hi, seed=0, mode="uniform", z_best=None, cv=0.15):
+    """Sample z inside [z_lo, z_hi]."""
+    d = len(z_lo)
+    rng = np.random.default_rng(seed)
+    if mode == "uniform":
+        U = qmc.LatinHypercube(d=d, seed=seed).random(N)
+        return z_lo + U*(z_hi - z_lo)
+    elif mode == "normal":
+        if z_best is None:
+            raise ValueError("z_best required for mode='normal'")
+        Z = rng.normal(loc=z_best, scale=cv, size=(N, d))
+        return np.clip(Z, z_lo, z_hi)
+    else:
+        raise ValueError("mode must be 'uniform' or 'normal'")
 
-        # Penalize unphysiological LVEDP
-        if LVEDP_sim < 4 or LVEDP_sim > 35:
-            sse += self.phys_weight * ((LVEDP_sim - 16) ** 2 / 16 ** 2)
-        return sse
-
-    # -- Objective for scipy.optimize --
-    def objective(self, theta):
-        return self.loss_all_matrices(theta)
-
-    # -- Run optimizer (DE + L-BFGS-B) --
-    def optimize(self):
-        np.random.seed(self.sub_id)
-        t0 = time.perf_counter()
-        result_de = differential_evolution(
-            func=self.objective,
-            bounds=self.bounds,
-            workers=cpu_count(),
-            maxiter=50,
-            popsize=5,
-            tol=1e-4,
-            disp=True
-        )
-        t1 = time.perf_counter()
-        print(f"✓ DE complete in {t1-t0:.1f}s, best loss {result_de.fun:.6f}")
-        print("Polishing with L-BFGS-B…")
-        t2 = time.perf_counter()
-        res_local = minimize(
-            fun=self.objective,
-            x0=result_de.x,
-            method='L-BFGS-B',
-            bounds=self.bounds,
-            options={'ftol': 1e-4, 'maxiter': 200, 'disp': False}
-        )
-        t3 = time.perf_counter()
-        print(f"✓ L-BFGS-B complete in {t3-t2:.1f}s, final loss {res_local.fun:.6f}")
-        print(f"Total optimization time: {t3-t0:.1f}s")
-        return res_local, t3-t0
-
-    def simulate_and_metrics(self, best_theta):
-        """Run the simulation with best-fit parameters and extract metrics and cycle."""
-        params = self.params.copy()
-        for name, val in zip(self.param_names, best_theta):
-            params[name] = val
-        t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = self.run_simulation(params)
-        cyc = self.cycle_cutting_algo(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
-        mets, idxs = self.extract_cycle_metrics(cyc)
-        return t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, params
-
-    def save_current_figures(self):
-        """Save all open matplotlib figures to subject's folder."""
-        for i, fig_num in enumerate(plt.get_fignums(), 1):
-            fig = plt.figure(fig_num)
-            filename = os.path.join(self.subject_dir, f"fig_{i}.png")
-            fig.savefig(filename, bbox_inches='tight', dpi=300)
-            print(f"Saved: {filename}")
-
-    def plot_all(self, t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, params_used):
-        """Plot all basic simulation results and cycle metrics (and save them)."""
-        # Elastance
-        E_full = self.elastance(t, params_used)
-        plt.figure(); plt.plot(t, E_full)
-        plt.title(f'Time-Varying Elastance (Emax={params_used["E_max"]:.3f}, Emin={params_used["E_min"]:.3f})')
-        plt.xlabel('Time [s]'); plt.ylabel('Elastance [mmHg/ml]'); plt.grid()
-        # Pressures
-        plt.figure()
-        plt.plot(t, P_ao, label='Aortic P')
-        plt.plot(t, P_lv, label='LV P')
-        plt.title('Pressure Waveforms')
-        plt.xlabel('Time [s]'); plt.ylabel('Pressure [mmHg]'); plt.legend(); plt.grid()
-        # Flows
-        plt.figure()
-        plt.plot(t, Q_lv_ao, label='Ao Flow')
-        plt.plot(t, Q_sv_lv, label='Mitral Flow')
-        plt.plot(t, Q_sys, label='Sys Flow')
-        plt.title('Flow Waveforms')
-        plt.xlabel('Time [s]'); plt.ylabel('Flow Rate [ml/s]'); plt.legend(); plt.grid()
-        # LV Volume
-        plt.figure()
-        plt.plot(t, V_lv, label='LV Volume')
-        plt.title('LV Volume')
-        plt.xlabel('Time [s]'); plt.ylabel('Volume [ml]'); plt.legend(); plt.grid()
-        # PV loop
-        plt.figure(); plt.plot(V_lv, P_lv)
-        plt.title('LV PV Loop')
-        plt.xlabel('Volume [ml]'); plt.ylabel('Pressure [mmHg]'); plt.grid()
-        # Cycle Pressure
-        t_c = cyc['t']
-        plt.figure()
-        plt.plot(t_c, cyc['P_ao'], label='P_ao')
-        plt.plot(t_c, cyc['P_lv'], label='P_lv')
-        plt.scatter([t_c[idxs['EDV_idx']]], [cyc['P_lv'][idxs['EDV_idx']]], c='r', marker='o', label='LVEDP@EDV')
-        plt.legend(); plt.grid(); plt.title("Cycle Pressures")
-        # Cycle Flow
-        plt.figure()
-        plt.plot(t_c, cyc['Q_ao'], label='Q_ao')
-        plt.plot(t_c, cyc['Q_sv'], label='Q_sv')
-        plt.scatter([t_c[idxs['peak_idx']]], [cyc['Q_ao'][idxs['peak_idx']]], c='g', marker='o', label='Q_peak')
-        plt.axvline(t_c[idxs['edur_start']], color='m', linestyle='--', label='EDur start')
-        plt.axvline(t_c[idxs['edur_end']], color='m', linestyle='--', label='EDur end')
-        plt.legend(); plt.grid(); plt.title("Cycle Flows")
-        # LV Volume (cycle)
-        plt.figure()
-        plt.plot(t_c, cyc['V_lv'], label='V_lv')
-        plt.scatter([t_c[idxs['ESV_idx']]], [cyc['V_lv'][idxs['ESV_idx']]], c='b', marker='o', label='ESV')
-        plt.scatter([t_c[idxs['EDV_idx']]], [mets['EDV']], c='r', marker='o', label='EDV')
-        plt.title('LV Volume (Cycle)'); plt.xlabel('Time [s]'); plt.ylabel('Volume [ml]')
-        plt.legend(); plt.grid()
-        # PV loop (cycle)
-        plt.figure()
-        plt.plot(cyc['V_lv'], cyc['P_lv'])
-        plt.scatter([mets['EDV']], [mets['LVEDP']], c='r', marker='o', label='EDV point')
-        plt.title('LV PV Loop (Cycle)')
-        plt.xlabel('Volume [ml]'); plt.ylabel('Pressure [mmHg]'); plt.legend(); plt.grid()
-
-    def compare_with_gt(self, mets, cyc):
-        """Print and return a dictionary comparing simulated and ground-truth metrics."""
-        gt = self.data_row
-        sim = {
-            'EDV': mets['EDV'],
-            'ESV': mets['ESV'],
-            'SV':  mets['EDV'] - mets['ESV'],
-            'EF':  (mets['EDV'] - mets['ESV'])/mets['EDV']*100 if mets['EDV']>0 else np.nan,
-            'bSBP': np.max(cyc['P_ao'])*1.1,
-            'bDBP': np.min(cyc['P_ao'])*1.1,
-            'bMAP': (np.max(cyc['P_ao'])*1.1 + 2*np.min(cyc['P_ao'])*1.1)/3,
-            'bPP':  np.max(cyc['P_ao'])*1.1 - np.min(cyc['P_ao'])*1.1,
-            'LVOT_Flow_Peak': mets['Q_peak'],
-            'time_LVOT_Flow_Peak': mets['t_peak'],
-            'ED': mets['EDur'],
-            'LVEDP': mets['LVEDP']
-        }
-        print(f"\n--- Comparing Simulation vs. Ground-Truth for sub_id={self.sub_id} ---")
-        print(f"{'Metric':>22} | {'Sim':>10} | {'GT':>10}")
-        print('-'*46)
-        for key in [
-            'EDV','ESV','SV','EF',
-            'bSBP','bDBP','bMAP','bPP',
-            'LVOT_Flow_Peak','time_LVOT_Flow_Peak',
-            'ED','LVEDP'
-        ]:
-            s_val = sim.get(key, np.nan)
-            gt_val = gt.get(key, np.nan)
-            print(f"{key:>22} | {s_val:10.3f} | {gt_val:10.3f}")
-        return sim
-
-    def collect_result_row(self, best, loss, opt_time, sim_matrices):
-        row = {'sub_id': self.sub_id, 'loss': loss, 'optimization_time_sec': opt_time,
-               'soft_weight': self.soft_weight, 'phys_weight': self.phys_weight}
-        for name, val in zip(self.param_names, best.x):
-            row[name] = val
-        row.update(sim_matrices)
-        return row
-
-    def run_one_lvedp(self, params=None):
-        """Return LVEDP for a given parameter dict (non-intrusive)."""
-        if params is None:
-            params = self.params
-        t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = self.run_simulation(params)
-        cyc = self.cycle_cutting_algo(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
-        mets, _ = self.extract_cycle_metrics(cyc)
-        return float(mets['LVEDP'])
-
-#end class SubjectSimulator
-
-def safe_lvedp_eval(sim, params):
-    """Run once; return LVEDP or NaN if failure/unphysiologic."""
+# ===================== evaluation utilities ==================================
+def _lvedp_once(sim, theta):
+    """Return LVEDP or np.nan (STRICT: invalid -> NaN)."""
     try:
-        y = sim.run_one_lvedp(params)
-        if not np.isfinite(y):
+        params = sim.params.copy()
+        for name, val in zip(sim.param_names, theta):
+            params[name] = float(val)
+        t, Pao, Plv, Vlv, Qmv, Qao, Qsys = sim.run_simulation(params)
+        cyc = sim.cycle_cutting_algo(t, Pao, Plv, Vlv, Qmv, Qao)
+        mets, _ = sim.extract_cycle_metrics(cyc)
+        y = float(mets["LVEDP"])
+        if not (np.isfinite(y) and PHYS_LVEDP_RANGE[0] <= y <= PHYS_LVEDP_RANGE[1]):
             return np.nan
-        if not (PHYS_LVEDP_RANGE[0] <= y <= PHYS_LVEDP_RANGE[1]):
-            return np.nan
-        return float(y)
+        return y
     except Exception:
         return np.nan
 
-def eval_matrix_parallel(sim, names, X, save_dir=None, label="mc", replace_invalid=True):
-    def one_row(xi):
-        p = sim.params.copy()
-        for j, n in enumerate(names):
-            p[n] = float(xi[j])
-        return safe_lvedp_eval(sim, p)
-
-    Y = Parallel(n_jobs=-1, verbose=10)(delayed(one_row)(xi) for xi in X)
-    Y = np.array(Y, float)
+def eval_matrix_parallel_theta(sim, Theta, save_dir=None, label="eval"):
+    """
+    Evaluate LVEDP for all rows of Θ in parallel.
+    Returns Y (float array) and mask_bad (True where invalid).
+    Does NOT replace invalids (decision is made at caller).
+    """
+    def one_row(theta): return _lvedp_once(sim, theta)
+    Y = Parallel(n_jobs=-1, verbose=10)(delayed(one_row)(theta) for theta in Theta)
+    Y = np.asarray(Y, float)
     mask_bad = ~np.isfinite(Y)
-
-    if replace_invalid and mask_bad.any():
-        med = np.nanmedian(Y)
-        Y[mask_bad] = med
-        print(f"[warn] replaced {mask_bad.mean()*100:.1f}% invalid LVEDP with median {med:.2f} mmHg")
-    elif not replace_invalid and mask_bad.any():
-        print(f"[info] found {mask_bad.mean()*100:.1f}% invalid LVEDP values - leaving them as NaN")
-
-    if save_dir is not None and mask_bad.any():
+    n_bad = int(mask_bad.sum()); n_all = len(Y)
+    print(f"[info] {label}: invalid fraction = {100.0*n_bad/n_all:.2f}% ({n_bad}/{n_all})")
+    if n_bad and save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        pd.DataFrame(X[mask_bad], columns=names).to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_{label}_invalid_params.csv"),
-            index=False
+        pd.DataFrame(Theta[mask_bad], columns=sim.param_names).to_csv(
+            os.path.join(save_dir, f"{sim.sub_id}_{label}_invalid_params.csv"), index=False
         )
     return Y, mask_bad
 
-
-
-def make_subject_bounds(sim, pct=None):
-    """Hard bounds (from your model) intersected with a ±% window around best-fit."""
-    if pct is None:
-        pct = {"R_sys":0.10,"Z_ao":0.10,"C_sa":0.10,"R_mv":0.10,
-               "E_max":0.10,"E_min":0.10,"t_peak":0.10,"V_tot":0.10,"C_sv":0.10}
-    names = sim.param_names
-    lb, ub = [], []
-    for n in names:
-        r = pct.get(n, 0.2)
-        base = float(sim.params[n])
-        lo_w, hi_w = (1-r)*base, (1+r)*base
-        hard_lo, hard_hi = sim.bounds[names.index(n)]
-        lb.append(max(lo_w, hard_lo))
-        ub.append(min(hi_w, hard_hi))
-
-    assert np.all(np.isfinite(lb)) and np.all(np.isfinite(ub)), "Non-finite bounds"
-    assert np.all(lb < ub), "Lower bound not < upper bound for at least one parameter"
-    return names, np.array(lb, float), np.array(ub, float)
-
-def default_prior_spec(sim):
-    """
-    Per-parameter prior spec relative to sim.params (means at best-fits).
-    - normal: specify coefficient of variation (cv), mean = best-fit
-    """
-    p = sim.params
-    return {
-        "R_sys":  ("normal", {"cv": 0.12}),
-        "Z_ao":   ("normal", {"cv": 0.12}),
-        "C_sa":   ("normal", {"cv": 0.15}),
-        "R_mv":   ("normal", {"cv": 0.15}),
-        "E_max":  ("normal", {"cv": 0.15}),
-        "E_min":  ("normal", {"cv": 0.15}),
-        # t_peak now also normal, centered at best-fit, with a reasonably tight cv
-        "t_peak": ("normal", {"cv": 0.10}),
-        "V_tot":  ("normal", {"cv": 0.12}),
-        "C_sv":   ("normal", {"cv": 0.15})
-    }
-
-
-def inverse_cdf_from_unit(u, name, best, lo, hi, prior):
-    """Map U in (0,1) to param value with prior; then truncate to [lo, hi]."""
-    kind, cfg = prior
-
-    if kind == "normal":
-        cv = cfg["cv"]
-        sigma = cv * abs(best) if best != 0 else cv
-        # Avoid zero sigma
-        if sigma <= 0:
-            x = best
-        else:
-            x = norm.ppf(u, loc=best, scale=sigma)
-
+# =========================== MC-UQ (drop invalid) ============================
+def mc_uq_lvedp(sim, N=2000, seed=0, mode="uniform", prior_cv=0.15, save_dir=None, pct_window=None):
+    # window
+    if pct_window is not None:
+        names, lb_win, ub_win = make_subject_bounds(sim, pct=pct_window)
+        z_lo, z_hi = window_to_z_interval(sim, lb_win, ub_win)
     else:
-        # fallback uniform if an unknown prior type sneaks in
-        x = lo + (hi - lo) * u
+        names = list(sim.param_names); z_lo = np.zeros(len(names)); z_hi = np.ones(len(names))
 
-    # truncate to hard window
-    return float(np.minimum(np.maximum(x, lo), hi))
+    # sample & evaluate
+    z_best = z_best_from_sim(sim)
+    Z = sample_Z_in_window(N=N, z_lo=z_lo, z_hi=z_hi, seed=seed, mode=mode, z_best=z_best, cv=prior_cv)
+    Theta = z_to_theta(sim, Z)
+    t0 = time.perf_counter()
+    Y_raw, mask_bad = eval_matrix_parallel_theta(sim, Theta, save_dir=save_dir, label="mc")
+    t1 = time.perf_counter()
+    valid = ~mask_bad
+    if valid.sum() == 0:
+        raise RuntimeError(f"No valid LVEDP samples in MC-UQ (sub {sim.sub_id})")
 
+    Theta_v, Z_v, Y_v = Theta[valid], Z[valid], Y_raw[valid]
+    mean = float(np.mean(Y_v)); sd = float(np.std(Y_v, ddof=1))
+    p025, p975 = np.percentile(Y_v, [2.5, 97.5])
 
-def save_subject_conditions(sim, names, lb, ub, prior_spec, save_dir):
-    """Save bounds and priors for reproducibility."""
-    df = pd.DataFrame({
-        "param": names,
-        "lower": lb,
-        "upper": ub,
-        "best_fit": [float(sim.params[n]) for n in names],
-        "prior_type": [prior_spec[n][0] for n in names],
-        "prior_config": [str(prior_spec[n][1]) for n in names]
-    })
-    os.makedirs(save_dir, exist_ok=True)
-    out_path = os.path.join(save_dir, f"{sim.sub_id}_uqsa_conditions.csv")
-    df.to_csv(out_path, index=False)
-    print(f"[{sim.sub_id}] Saved conditions → {out_path}")
+    # Console summary
+    print(_hdr(f"UQ Summary (sub {sim.sub_id})"))
+    print(f"N_total: {N:,} | N_valid: {valid.sum():,} | Invalid: {mask_bad.mean()*100:.2f}%")
+    print(f"LVEDP mean={mean:.2f}  sd={sd:.2f}  95%PI=[{p025:.2f}, {p975:.2f}]")
+    print(f"UQ compute time: {_sec_to_str(t1-t0)}")
 
+    # Save outputs
+    pd.DataFrame(Theta_v, columns=names).to_csv(os.path.join(save_dir, f"{sim.sub_id}_uq_theta.csv"), index=False)
+    pd.DataFrame(Z_v,     columns=names).to_csv(os.path.join(save_dir, f"{sim.sub_id}_uq_z.csv"), index=False)
+    pd.DataFrame({"LVEDP": Y_v}).to_csv(os.path.join(save_dir, f"{sim.sub_id}_uq_lvedp.csv"), index=False)
+    pd.Series({"mean":mean, "sd":sd, "PI95":(float(p025), float(p975)), "N":int(valid.sum()), "N_total":int(N)}).to_json(
+        os.path.join(save_dir, f"{sim.sub_id}_uq_summary.json")
+    )
+    # legacy aliases for your readers/plots
+    pd.DataFrame(Theta_v, columns=names).to_csv(os.path.join(save_dir, f"{sim.sub_id}_uq_params.csv"), index=False)
+    pd.DataFrame({"LVEDP": Y_v}).to_csv(os.path.join(save_dir, f"{sim.sub_id}_uq_samples.csv"), index=False)
+
+    # Save the window for traceability
+    if pct_window is not None:
+        pd.DataFrame({"param":names, "theta_low":lb_win, "theta_high":ub_win}).to_csv(
+            os.path.join(save_dir, f"{sim.sub_id}_uqsa_window_theta.csv"), index=False
+        )
+        pd.DataFrame({"param":names, "z_low":z_lo, "z_high":z_hi}).to_csv(
+            os.path.join(save_dir, f"{sim.sub_id}_uqsa_window_z.csv"), index=False
+        )
+
+    # Return bundle
+    return {"names": names, "Z": Z_v, "Theta": Theta_v, "Y": Y_v, "mask_bad": mask_bad,
+            "summary": {"mean":mean, "sd":sd, "PI95":(float(p025), float(p975)), "N":int(valid.sum()), "N_total":int(N)}}
+
+# ========== Sobol SA (LVEDP keep-all via median replacement; VALIDITY std) ===
 def sobol_with_ci(problem, Y, calc_second_order=False, n_resamples=500, conf_level=0.95, seed=0):
-    """
-    Wrapper around SALib's Sobol analyze() to add bootstrap confidence intervals.
-    Works with SALib >=1.5 (no built-in CI).
-    """
-    rng = np.random.default_rng(seed)
-
-    # Core Sobol analysis
     Si = sobol_analyze.analyze(problem, Y, calc_second_order=calc_second_order, print_to_console=False)
-
-    # Bootstrap resampling
-    n = len(Y)
-    S1_samples, ST_samples = [], []
+    rng = np.random.default_rng(seed)
+    n = len(Y); S1_s, ST_s = [], []
     for _ in range(n_resamples):
-        idx = rng.integers(0, n, n)  # sample with replacement
-        Si_resamp = sobol_analyze.analyze(problem, Y[idx], calc_second_order=calc_second_order,
-                                          print_to_console=False)
-        S1_samples.append(Si_resamp["S1"])
-        ST_samples.append(Si_resamp["ST"])
-
-    S1_samples = np.array(S1_samples)
-    ST_samples = np.array(ST_samples)
-
-    alpha = (1 - conf_level) / 2
-    Si["S1_conf"] = np.nanpercentile(S1_samples, [100*alpha, 100*(1-alpha)], axis=0).T
-    Si["ST_conf"] = np.nanpercentile(ST_samples, [100*alpha, 100*(1-alpha)], axis=0).T
-
+        idx = rng.integers(0, n, n)
+        Si_r = sobol_analyze.analyze(problem, Y[idx], calc_second_order=calc_second_order, print_to_console=False)
+        S1_s.append(Si_r["S1"]); ST_s.append(Si_r["ST"])
+    S1_s, ST_s = np.asarray(S1_s), np.asarray(ST_s)
+    alpha = (1 - conf_level)/2.0
+    Si["S1_conf"] = np.nanpercentile(S1_s,[100*alpha,100*(1-alpha)],axis=0).T
+    Si["ST_conf"] = np.nanpercentile(ST_s,[100*alpha,100*(1-alpha)],axis=0).T
     return Si
 
-def mc_uq_lvedp(sim, N=2000, seed=0, pct=None, prior_spec=None, save_dir=None):
-    names, lb, ub = make_subject_bounds(sim, pct)
-    if prior_spec is None:
-        prior_spec = default_prior_spec(sim)
+def sobol_sa_validity(sim, N=1024, seed=0, n_resamples=500, save_dir=None, pct_window=None, second_order=False):
+    names = list(sim.param_names); d = len(names)
+    if pct_window is not None:
+        _, lb_win, ub_win = make_subject_bounds(sim, pct=pct_window)
+        z_lo, z_hi = window_to_z_interval(sim, lb_win, ub_win)
+    else:
+        z_lo = np.zeros(d); z_hi = np.ones(d)
 
-    d = len(names)
-    U = qmc.LatinHypercube(d=d, seed=seed).random(N)
-    X = np.empty_like(U)
-    for j, n in enumerate(names):
-        for i in range(N):
-            X[i, j] = inverse_cdf_from_unit(
-                U[i, j], n, best=float(sim.params[n]),
-                lo=lb[j], hi=ub[j], prior=prior_spec[n]
-            )
-
-    # Do NOT replace invalid values for MC - we want to drop them
-    Y_raw, mask_bad = eval_matrix_parallel(sim, names, X, save_dir=save_dir,
-                                           label="mc", replace_invalid=False)
-
-    valid = ~mask_bad
-    n_total = N
-    n_valid = int(valid.sum())
-    invalid_rate = (n_total - n_valid) / n_total * 100.0
-    print(f"[{sim.sub_id}] UQ invalid LVEDP rate: {invalid_rate:.1f}%, "
-          f"kept {n_valid} / {n_total} samples")
-
-    if n_valid == 0:
-        raise RuntimeError(f"No valid LVEDP samples for subject {sim.sub_id} in MC UQ")
-
-    X_valid = X[valid]
-    Y_valid = Y_raw[valid]
-
-    mean = float(np.mean(Y_valid))
-    sd   = float(np.std(Y_valid, ddof=1))
-    p025, p975 = np.percentile(Y_valid, [2.5, 97.5])
-
-    return {
-        "names": names,
-        "lb": lb,
-        "ub": ub,
-        "X": X_valid,
-        "Y": Y_valid,
-        "mask_bad": mask_bad,
-        "summary": {
-            "mean": mean,
-            "sd": sd,
-            "PI95": (float(p025), float(p975)),
-            "N": n_valid,
-            "N_total": int(n_total)
-        }
-    }
-
-def sobol_sa_lvedp(sim, N=1024, seed=0, pct=None, prior_spec=None,
-                   second_order=False, n_resamples=500, save_dir=None):
-    names, lb, ub = make_subject_bounds(sim, pct)
-    if prior_spec is None:
-        prior_spec = default_prior_spec(sim)
-
-    problem = {"num_vars": len(names), "names": names, "bounds": [[0.0, 1.0]]*len(names)}
+    problem = {"num_vars": d, "names": names, "bounds": [[0.0, 1.0]]*d}
     U = sobol_sample.sample(problem, N, calc_second_order=second_order)
+    Z = z_lo + U*(z_hi - z_lo)
+    Theta = z_to_theta(sim, Z)
 
-    X = np.empty_like(U)
-    for j, n in enumerate(names):
-        for i in range(U.shape[0]):
-            X[i, j] = inverse_cdf_from_unit(
-                U[i, j], n,
-                best=float(sim.params[n]),
-                lo=lb[j], hi=ub[j],
-                prior=prior_spec[n]
-            )
+    Y_lvedp, mask_bad = eval_matrix_parallel_theta(sim, Theta, save_dir=save_dir, label="sobol_validity")
+    Y_valid = (~mask_bad).astype(float)  # 0/1 validity
 
-    # For Sobol we still need a full vector with no NaNs, so we keep replacement on
-    Y, mask_bad = eval_matrix_parallel(sim, names, X, save_dir=save_dir,
-                                       label="sobol", replace_invalid=True)
-    print(f"[{sim.sub_id}] Sobol invalid LVEDP rate (before replacement): "
-          f"{np.mean(mask_bad) * 100:.1f}%")
+    # Analyze and save
+    t0 = time.perf_counter()
+    Si = sobol_with_ci(problem, Y_valid, calc_second_order=False, n_resamples=n_resamples)
+    t1 = time.perf_counter()
+    print(_hdr(f"Sobol VALIDITY (sub {sim.sub_id})"))
+    print(f"Base N={N:,} | d={d} | Total evals={len(Y_valid):,} | Invalid (for LVEDP)={mask_bad.mean()*100:.2f}%")
+    print(f"P(valid) = {Y_valid.mean():.3f} | SA time: {_sec_to_str(t1-t0)}")
 
-    # Run SA + bootstrap wrapper
+    # Save results
+    S1c, STc = np.asarray(Si["S1_conf"]), np.asarray(Si["ST_conf"])
+    df_sa = pd.DataFrame({
+        "sub_id": sim.sub_id, "metric": "VALIDITY", "param": names,
+        "S1": Si["S1"].tolist(), "S1_low": S1c[:,0], "S1_high": S1c[:,1],
+        "ST": Si["ST"].tolist(), "ST_low": STc[:,0], "ST_high": STc[:,1]
+    })
+    df_sa.to_csv(os.path.join(save_dir, f"{sim.sub_id}_sobol_validity.csv"), index=False)
+
+    # Also write a sobol_params.csv (legacy) with the Theta used for VALIDITY SA
+    pd.DataFrame(Theta, columns=names).to_csv(os.path.join(save_dir, f"{sim.sub_id}_sobol_params.csv"), index=False)
+
+    return {"names": names, "Theta": Theta, "U": U, "Si": Si, "mask_bad": mask_bad}
+
+def sobol_sa_lvedp_keep_all(sim, N=1024, seed=0, n_resamples=500, save_dir=None, pct_window=None, second_order=False):
+    """
+    Sobol SA on LVEDP where we KEEP the full Saltelli design:
+      - Evaluate Y
+      - If invalids exist, REPLACE invalid Y with median(valid Y)
+      - Then run SALib analyze() on the full vector
+    This avoids retries and preserves the estimator structure.
+    """
+    names = list(sim.param_names); d = len(names)
+    if pct_window is not None:
+        _, lb_win, ub_win = make_subject_bounds(sim, pct=pct_window)
+        z_lo, z_hi = window_to_z_interval(sim, lb_win, ub_win)
+    else:
+        z_lo = np.zeros(d); z_hi = np.ones(d)
+
+    problem = {"num_vars": d, "names": names, "bounds": [[0.0, 1.0]]*d}
+    U = sobol_sample.sample(problem, N, calc_second_order=second_order)
+    Z = z_lo + U*(z_hi - z_lo)
+    Theta = z_to_theta(sim, Z)
+
+    Y, mask_bad = eval_matrix_parallel_theta(sim, Theta, save_dir=save_dir, label="sobol_lvedp")
+    n_bad = int(mask_bad.sum())
+    if n_bad > 0:
+        med = float(np.nanmedian(Y))
+        Y[mask_bad] = med
+        print(f"[note] Sobol LVEDP: replaced {n_bad} invalid outputs with median={med:.2f} (SA only).")
+
+    # Analyze and save
+    t0 = time.perf_counter()
     Si = sobol_with_ci(problem, Y, calc_second_order=second_order, n_resamples=n_resamples)
+    t1 = time.perf_counter()
+    print(_hdr(f"Sobol LVEDP (sub {sim.sub_id})"))
+    print(f"Base N={N:,} | d={d} | Total evals={len(Y):,} | Invalid replaced={n_bad}")
+    print(f"SA time: {_sec_to_str(t1-t0)}")
 
-    out = {
-        "names": names,
-        "S1": Si["S1"].tolist(),
-        "ST": Si["ST"].tolist(),
-        "S1_conf": Si["S1_conf"],
-        "ST_conf": Si["ST_conf"],
-        "N_base": int(N),
-        "n_eval": int(len(Y)),
-        "mask_bad": mask_bad,
-        "X": X,
-        "U": U
-    }
-    if second_order:
-        out["S2"] = Si["S2"].tolist()
-        out["S2_conf"] = Si["S2_conf"]
-    return out
+    # Save results
+    S1c, STc = np.asarray(Si["S1_conf"]), np.asarray(Si["ST_conf"])
+    df_sa = pd.DataFrame({
+        "sub_id": sim.sub_id, "metric": "LVEDP", "param": names,
+        "S1": Si["S1"].tolist(), "S1_low": S1c[:,0], "S1_high": S1c[:,1],
+        "ST": Si["ST"].tolist(), "ST_low": STc[:,0], "ST_high": STc[:,1]
+    })
+    df_sa.to_csv(os.path.join(save_dir, f"{sim.sub_id}_sobol_lvedp.csv"), index=False)
+    return {"names": names, "Theta": Theta, "U": U, "Si": Si, "mask_bad": mask_bad}
 
-def sobol_sa_validity(sim, N=1024, seed=0, pct=None, prior_spec=None,
-                      n_resamples=500, save_dir=None):
-    """
-    Sobol sensitivity analysis on VALIDITY indicator:
-        Y_valid = 1 if LVEDP is valid (within PHYS_LVEDP_RANGE and simulation ok)
-        Y_valid = 0 if invalid
-    This tells you which parameters mostly control model unphysiology/failure.
-    """
-    names, lb, ub = make_subject_bounds(sim, pct)
-    if prior_spec is None:
-        prior_spec = default_prior_spec(sim)
+# ============================ Orchestration & Saving ==========================
+def run_uq_sa_for_subject(sim, save_dir, N_mc, sobol_baseN, sobol_boot,
+                          mc_mode, prior_cv, pct_window, second_order):
+    os.makedirs(save_dir, exist_ok=True)
 
-    problem = {"num_vars": len(names), "names": names, "bounds": [[0.0, 1.0]] * len(names)}
-    U = sobol_sample.sample(problem, N, calc_second_order=False)
+    # Show hard bounds and center θ*
+    print(_hdr(f"Start (sub {sim.sub_id})"))
+    for k in sim.param_names:
+        print(f"θ* {k:7s} = {float(sim.params[k]):.6g}")
+    for n, lo, hi in zip(sim.param_names, sim.lb, sim.ub):
+        print(f"hard {n:7s}: {lo:.6g} -> {hi:.6g}")
 
-    # Map Sobol U ∈ [0,1] to parameter space using the same priors as LVEDP SA
-    X = np.empty_like(U)
-    for j, n in enumerate(names):
-        for i in range(U.shape[0]):
-            X[i, j] = inverse_cdf_from_unit(
-                U[i, j], n,
-                best=float(sim.params[n]),
-                lo=lb[j], hi=ub[j],
-                prior=prior_spec[n]
-            )
+    # Compute & print the active subject-specific window
+    names, lb_win, ub_win = make_subject_bounds(sim, pct=pct_window)
+    z_lo, z_hi = window_to_z_interval(sim, lb_win, ub_win)
 
-    # Evaluate LVEDP once, but we only care about mask_bad (valid vs invalid)
-    # IMPORTANT: no replacement, we just need mask_bad.
-    Y_lvedp, mask_bad = eval_matrix_parallel(
-        sim, names, X, save_dir=save_dir,
-        label="sobol_validity", replace_invalid=False
+    print(_hdr(f"Active Window (sub {sim.sub_id})"))
+    print("θ-window:")
+    for n, lo, hi in zip(names, lb_win, ub_win):
+        cen = float(sim.params[n])
+        print(f"  {n:7s}: {lo:.6g} -> {hi:.6g} (center={cen:.6g})")
+    print("z-window:")
+    for n, lo, hi in zip(names, z_lo, z_hi):
+        print(f"  {n:7s}: {lo:.4f} -> {hi:.4f}")
+
+    # Save window CSVs
+    pd.DataFrame({"param":names, "theta_low":lb_win, "theta_high":ub_win}).to_csv(
+        os.path.join(save_dir, f"{sim.sub_id}_uqsa_window_theta.csv"), index=False
+    )
+    pd.DataFrame({"param":names, "z_low":z_lo, "z_high":z_hi}).to_csv(
+        os.path.join(save_dir, f"{sim.sub_id}_uqsa_window_z.csv"), index=False
     )
 
-    # Build validity indicator: 1 = valid, 0 = invalid
-    Y_valid = (~mask_bad).astype(float)
-    invalid_rate = mask_bad.mean() * 100.0
-    print(f"[{sim.sub_id}] Sobol VALIDITY invalid rate: {invalid_rate:.1f}% "
-          f"(Y_valid mean ≈ probability of validity: {Y_valid.mean():.3f})")
-
-    # Run Sobol on Y_valid
-    Si = sobol_with_ci(problem, Y_valid,
-                       calc_second_order=False,
-                       n_resamples=n_resamples)
-
-    out = {
-        "names": names,
-        "S1": Si["S1"].tolist(),
-        "ST": Si["ST"].tolist(),
-        "S1_conf": Si["S1_conf"],
-        "ST_conf": Si["ST_conf"],
-        "N_base": int(N),
-        "n_eval": int(len(Y_valid)),
-        "mask_bad": mask_bad,
-        "X": X,
-        "U": U,
-    }
-    return out
-
-
-
-def run_uq_sa_for_subject(sim, N_mc=2000, N_sobol=1024, pct=None,
-                          prior_spec=None, save_dir=None, n_resamples=500):
-
-    names, lb, ub = make_subject_bounds(sim, pct)
-
-    if prior_spec is None:
-        prior_spec = default_prior_spec(sim)
-
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        save_subject_conditions(sim, names, lb, ub, prior_spec, save_dir)
-
-    # === UQ on LVEDP ===
-    mc = mc_uq_lvedp(sim, N=N_mc, seed=0, pct=pct,
-                     prior_spec=prior_spec, save_dir=save_dir)
-
-    # === Sobol SA on LVEDP ===
-    sa_lvedp = sobol_sa_lvedp(sim, N=N_sobol, seed=0, pct=pct,
-                              prior_spec=prior_spec, second_order=False,
-                              n_resamples=n_resamples, save_dir=save_dir)
-
-    # === Sobol SA on VALIDITY (probability of being valid) ===
-    sa_valid = sobol_sa_validity(sim, N=N_sobol, seed=0, pct=pct,
-                                 prior_spec=prior_spec, n_resamples=n_resamples,
-                                 save_dir=save_dir)
-
-    # UQ samples dataframe (LVEDP only, valid cases)
-    df_uq = pd.DataFrame({"sub_id": [sim.sub_id] * len(mc["Y"]), "LVEDP": mc["Y"]})
-
-    # SA on LVEDP
-    S1_conf_L = np.asarray(sa_lvedp["S1_conf"])
-    ST_conf_L = np.asarray(sa_lvedp["ST_conf"])
-    df_sa_lvedp = pd.DataFrame({
-        "sub_id": sim.sub_id,
-        "metric": "LVEDP",
-        "param": sa_lvedp["names"],
-        "S1": sa_lvedp["S1"],
-        "S1_low": S1_conf_L[:, 0],
-        "S1_high": S1_conf_L[:, 1],
-        "ST": sa_lvedp["ST"],
-        "ST_low": ST_conf_L[:, 0],
-        "ST_high": ST_conf_L[:, 1],
+    # Save conditions for reproducibility
+    df_cond = pd.DataFrame({
+        "param": names, "hard_lower": sim.lb, "hard_upper": sim.ub,
+        "theta_low": lb_win, "theta_high": ub_win,
+        "best_fit": [float(sim.params[n]) for n in names],
+        "scale_type": getattr(sim, "scale_type", ["?"]*len(names))
     })
+    df_cond.to_csv(os.path.join(save_dir, f"{sim.sub_id}_uqsa_conditions.csv"), index=False)
 
-    # SA on VALIDITY (probability of valid LVEDP)
-    S1_conf_V = np.asarray(sa_valid["S1_conf"])
-    ST_conf_V = np.asarray(sa_valid["ST_conf"])
-    df_sa_valid = pd.DataFrame({
-        "sub_id": sim.sub_id,
-        "metric": "VALIDITY",
-        "param": sa_valid["names"],
-        "S1": sa_valid["S1"],
-        "S1_low": S1_conf_V[:, 0],
-        "S1_high": S1_conf_V[:, 1],
-        "ST": sa_valid["ST"],
-        "ST_low": ST_conf_V[:, 0],
-        "ST_high": ST_conf_V[:, 1],
-    })
+    # ---- UQ (drop invalid) ----
+    mc = mc_uq_lvedp(sim, N=N_mc, seed=0, mode=mc_mode, prior_cv=prior_cv, save_dir=save_dir, pct_window=pct_window)
 
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        # UQ params & outputs (only valid samples)
-        pd.DataFrame(mc["X"], columns=mc["names"]).to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_uq_params.csv"), index=False
+    # ---- Sobol VALIDITY (0/1) ----
+    sa_valid = sobol_sa_validity(sim, N=sobol_baseN, seed=0, n_resamples=sobol_boot,
+                                 save_dir=save_dir, pct_window=pct_window, second_order=False)
+
+    # ---- Sobol LVEDP (keep-all with median replacement) ----
+    sa_lvedp = sobol_sa_lvedp_keep_all(sim, N=sobol_baseN, seed=0, n_resamples=sobol_boot,
+                                       save_dir=save_dir, pct_window=pct_window, second_order=second_order)
+    # Top contributors (reporting convenience)
+    if sa_lvedp is not None:
+        names = sa_lvedp["names"]
+        ST = np.asarray(sa_lvedp["Si"]["ST"])
+        S1 = np.asarray(sa_lvedp["Si"]["S1"])
+        top_st = sorted(zip(names, ST), key=lambda x: -x[1])[:3]
+        top_s1 = sorted(zip(names, S1), key=lambda x: -x[1])[:3]
+        print(f"Top ST (LVEDP): {[(n, round(v,3)) for n,v in top_st]}")
+        print(f"Top S1 (LVEDP): {[(n, round(v,3)) for n,v in top_s1]}")
+
+    # VALIDITY summary
+    names_v = sa_valid["names"]
+    ST_v = np.asarray(sa_valid["Si"]["ST"])
+    top_st_v = sorted(zip(names_v, ST_v), key=lambda x: -x[1])[:3]
+    print(f"Top ST (VALIDITY): {[(n, round(v,3)) for n,v in top_st_v]}")
+
+    return mc, sa_lvedp, sa_valid
+
+# ================================== MAIN =====================================
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    os.makedirs(SAVE_ROOT, exist_ok=True)
+
+    # Load Excel (optional)
+    df = None
+    if os.path.exists(EXCEL_PATH):
+        try:
+            df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=3)
+        except Exception as e:
+            print(f"[warn] Excel read with header=3 failed: {e}")
+            try:
+                df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME)
+                print("[info] Retried without header=3")
+            except Exception as ee:
+                print(f"[warn] Excel read still failed: {ee} -> continue with defaults")
+                df = None
+    else:
+        print(f"[warn] Excel not found at: {EXCEL_PATH} -> continue with defaults")
+
+    for sub_id in SUBJECT_LIST:
+        # Prepare subject row
+        if df is not None and 'Sub ID' in df.columns:
+            row = df.loc[df['Sub ID'] == sub_id]
+            data_row = row.squeeze() if len(row) > 0 else pd.Series(dtype=float)
+            if len(row) == 0:
+                print(f"[warn] Sub ID {sub_id} not found in Excel; using defaults.")
+        else:
+            data_row = pd.Series(dtype=float)
+
+        sim = SubjectSimulator(data_row, sub_id, SAVE_ROOT)
+        updates = try_override_params_from_row(sim, data_row)
+        if updates: print(f"[info] Overrode {updates} param(s) from Excel for sub {sub_id}")
+
+        save_dir = os.path.join(SAVE_ROOT, str(sub_id))
+        t0 = time.perf_counter()
+        mc, sa_l, sa_v = run_uq_sa_for_subject(
+            sim, save_dir,
+            N_mc=N_MC, sobol_baseN=SOBOL_BASE_N, sobol_boot=SOBOL_BOOT,
+            mc_mode=MC_MODE, prior_cv=PRIOR_CV, pct_window=PCT_WINDOW,
+            second_order=SECOND_ORDER
         )
-        pd.DataFrame({"LVEDP": mc["Y"]}).to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_uq_samples.csv"), index=False
-        )
-        pd.Series(mc["summary"]).to_json(
-            os.path.join(save_dir, f"{sim.sub_id}_uq_summary.json")
-        )
+        t1 = time.perf_counter()
 
-        # Sobol params (same design for LVEDP and VALIDITY)
-        pd.DataFrame(sa_lvedp["X"], columns=sa_lvedp["names"]).to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_sobol_params.csv"), index=False
-        )
-
-        # Sobol results (two metrics in one file or separate as you prefer)
-        df_sa_lvedp.to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_sobol_lvedp.csv"),
-            index=False
-        )
-        df_sa_valid.to_csv(
-            os.path.join(save_dir, f"{sim.sub_id}_sobol_validity.csv"),
-            index=False
-        )
-
-    return df_uq, df_sa_lvedp, df_sa_valid, mc, sa_lvedp, sa_valid
-
-
-
-# -- MAIN SCRIPT --
-if __name__ == '__main__':
-    save_root = (
-    r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-    r"\3_Codes\Python\Data_Results\Results_UQSA_Population_Level")
-
-    uqsa_root = os.path.join(save_root, "UQ_SA")
-    excel_path = (r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-                 r"\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx")
-    sheet_name = "Study_3_V4.1_T6"
-    combined_df = pd.read_excel(excel_path, sheet_name=sheet_name, header=3, nrows=69)
-
-
-    #subject_list = [316, 319, 323, 325, 326, 327, 328, 329, 331, 332, 334, 336, 337, 338, 339, 341, 342, 343,
-                     #344, 346, 347, 349, 351, 352, 354, 356, 357, 359, 360, 361, 362, 363, 364, 365]# full batch run
-    subject_list = [999]
-
-    #subject_list = [316, 319, 323, 325, 326, 327] # batch 1
-    #subject_list = [328, 329, 331, 332, 334, 336] # batch 2
-    #subject_list = [337, 338, 339, 341, 342, 343, 344, 346, 347, 349, 351, 352] # batch 3
-    #subject_list = [354, 356, 357, 359, 360, 361, 362, 363, 364, 365] # batch 4
-
-    for sub_id in subject_list:
-        data_row = combined_df.loc[combined_df['Sub ID'] == sub_id].squeeze()
-        sim = SubjectSimulator(data_row, sub_id, save_root)
-        print(f"\nParameters for subject {sub_id}:")
-        for k, v in sim.params.items():
-            print(f"  {k:8} = {v}")
-
-        names, lb, ub = make_subject_bounds(sim, pct=None)
-        print(f"\n[{sim.sub_id}] Parameter bounds used for UQ/SA:")
-        for n, lo, hi in zip(names, lb, ub):
-            print(f"  {n:7s}: {lo:.6g} → {hi:.6g}   (best={float(sim.params[n]):.6g})")
-            if not (np.isfinite(lo) and np.isfinite(hi)) or lo >= hi:
-                print(f"  [warn] Bad interval for {n}: [{lo}, {hi}]")
-
-        t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys = sim.run_simulation(sim.params)
-        cyc = sim.cycle_cutting_algo(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao)
-        mets, idxs = sim.extract_cycle_metrics(cyc)
-        sim_matrices = sim.compare_with_gt(mets, cyc)
-        sim.plot_all(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, sim.params)  # Plot all
-        sim.save_current_figures()  # Save all
-        plt.close('all')  # Close all to avoid memory leak
-        #plt.show()
-
-     # === UQ + SA ===
-        save_dir = os.path.join(uqsa_root, str(sub_id))
-        df_uq, df_sa_lvedp, df_sa_valid, mc, sa_lvedp, sa_valid = run_uq_sa_for_subject(
-            #sim, N_mc=75000, N_sobol=2048, pct=None, save_dir=save_dir, n_resamples=2000
-            sim, N_mc=1000, N_sobol=64, pct=None, save_dir=save_dir, n_resamples=64
-        )
-
-        print(f"[{sub_id}] UQ LVEDP: mean={mc['summary']['mean']:.2f}, "
-              f"sd={mc['summary']['sd']:.2f}, 95%PI={mc['summary']['PI95']}")
-        print(f"[{sub_id}] Top ST (LVEDP):",
-              sorted(zip(sa_lvedp["names"], sa_lvedp["ST"]), key=lambda x: -x[1])[:3])
-        print(f"[{sub_id}] Top ST (VALIDITY):",
-              sorted(zip(sa_valid["names"], sa_valid["ST"]), key=lambda x: -x[1])[:3])
-
-#end main
+        s = mc["summary"]
+        print(_hdr(f"DONE (sub {sub_id})"))
+        print(f"UQ LVEDP (valid only): mean={s['mean']:.2f}, sd={s['sd']:.2f}, 95%PI={tuple(round(x,2) for x in s['PI95'])} | N_valid={s['N']:,}/{s['N_total']:,}")
+        print(f"Total wall time: {_sec_to_str(t1-t0)}")
