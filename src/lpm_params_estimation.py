@@ -1,3 +1,11 @@
+#1. Save csv file after optimisation of each subject, and append to the file.
+#2. Save additional information - DE loss and time taken, L-BFGS-B loss and time taken
+#3. Save a csv file with optimised values and model output after DE alone for each subject.
+#4. Integrated the new params for R_sys, Z_ao and C_sa as per the KNN Virtual to Patient Matching Algo
+#5. Modified the non_physiological range penalty to a hinge to bound method.
+#6. Fixed the SWS-LVEDP soft prior weight based on the maximum‑a‑posteriori formulation in absolute units, prior based on RMSE of the regression model.
+#7. Fixed the scaling of loss function error by physiological constants K as in Nikolai's paper and Hybrid WLS
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
@@ -8,15 +16,14 @@ import time
 from multiprocessing import cpu_count
 
 class SubjectSimulator:
-    def __init__(self, data_row, sub_id, save_root, soft_weight_LVEDP = 1, non_phys_weight = 10.0): #change here
+    def __init__(self, data_row, sub_id, save_root, soft_weight_LVEDP = 10, lambda_phys = 100.0):
         """Initialize all subject-specific and fixed simulation parameters."""
         self.sub_id = sub_id
         self.data_row = data_row
         self.save_root = save_root
         # Weights for loss function
         self.soft_weight_LVEDP = soft_weight_LVEDP
-        self.non_phys_weight = non_phys_weight
-
+        self.lambda_phys = lambda_phys
 
         # Fixed simulation and elastance parameters
         self.cycles = 10
@@ -35,8 +42,9 @@ class SubjectSimulator:
 
         #change here
         #self.Emin_mech_prior = data_row['Emin_mech_prior_thin_wall_k_2.5']
-        self.Emin_mech_prior = data_row['Emin_mech_thick_wall_scaled_0_2.5']
+        #self.Emin_mech_prior = data_row['Emin_mech_thick_wall_scaled_0_2.5']
         #self.Emin_mech_prior = data_row['Emin_exp_prior']
+        self.Emin_mech_prior = data_row['Emin_isotonic_cal']
 
 
         self.bpm = data_row['HR']
@@ -52,7 +60,7 @@ class SubjectSimulator:
             'C_sa': data_row['C_sa'], #change here
             'R_mv': 0.05,
             'E_max': 5,
-            'E_min': data_row['Emin_mech_thick_wall_scaled_0_2.5'], #'E_min': 0.05, #change here
+            'E_min': data_row['Emin_isotonic_cal'],  #'E_min': 0.05, #change here
             't_peak': 0.35,
             'V_tot': 300,
             'C_sv': 15,
@@ -65,7 +73,7 @@ class SubjectSimulator:
             (self.params['C_sa'] * (1 - 0.20), self.params['C_sa'] * (1 + 0.20)),#(0.5, 10.0), #change here
             (0.01, 0.1),     # R_mv
             (0.9, 10.0),     # E_max
-            (self.params['E_min'] * (1 - 0.20), self.params['E_min'] * (1 + 0.20)), # (0.01, 2.5), #change here
+            (self.params['E_min'] * (1 - 0.70), self.params['E_min'] * (1 + 0.70)),  # (0.01, 2.5), #change here
             (0.1, 0.7),      # t_peak
             (50.0, 2000),    # V_tot
             (0.5, 30.0)      # C_sv
@@ -75,15 +83,79 @@ class SubjectSimulator:
         V_sv0 = self.params['V_tot'] - self.V_LV0 - V_sa0
         self.y0 = [self.V_LV0, V_sa0, V_sv0]
         # Metric weights for loss calculation
+
         self.weights = {
-            'EDV': 1, 'ESV': 1, 'SV': 1, 'EF': 1, #change here
-            'bSBP': 1, 'bDBP': 1, 'bMAP': 1, 'bPP': 1, #change here
-            'LVOT_Flow_Peak': 1, 'time_LVOT_Flow_Peak': 1, 'ED': 1, #change here
-            'LVEDP': 0.0
+            'EDV': 1, 'ESV': 1, 'SV': 0, 'EF': 0,  # SV/EF report-only
+            'bSBP': 1, 'bDBP': 1, 'bMAP': 0, 'bPP': 0,  # MAP/PP report-only
+            'LVOT_Flow_Peak': 1, 'time_LVOT_Flow_Peak': 1, 'ED': 1,
+            'LVEDP': 0.0  # prior handled separately
         }
+        # add a single toggle
+        self.loss_scaling_mode = 'cohort_minmax' # or   'hybrid_wls'
+
+        # --- MAP soft-prior settings (calibrated from your GT vs. prediction pairs) ---
+        # RMSE of your SWS->LVEDP regression in absolute mmHg:
+        self.sigma_prior = 4.235  # mmHg
+
+        # Optional: clinical tolerance dead-zone; no prior penalty within ±3 mmHg of the reg. mean
+        self.prior_deadzone = 3.0  # mmHg
+        self.use_prior_deadzone = True
+
+        # Optional: tiny multiplicative "fudge" around the MAP value (keep at 1.0 unless you do CV tuning)
+        self.kappa_prior = 1.0  # {0.5, 1.0, 2.0}, etc. 1.0 = pure MAP
+
         # For saving plots/results
         self.subject_dir = os.path.join(self.save_root, str(self.sub_id))
         os.makedirs(self.subject_dir, exist_ok=True)
+
+        self._precompute_bounds_arrays()
+    # === V4 NORMALIZATION: Parameter scaling helpers (θ ↔ z) ================
+    def _precompute_bounds_arrays(self):
+        """Cache bounds + scaling metadata."""
+        self.lb = np.array([b[0] for b in self.bounds], dtype=float)
+        self.ub = np.array([b[1] for b in self.bounds], dtype=float)
+        self.span = self.ub - self.lb
+
+        # Order must match self.param_names:
+        # ['R_sys','Z_ao','C_sa','R_mv','E_max','E_min','t_peak','V_tot','C_sv']
+        # log = strictly positive wide-range; lin = bounded time fraction
+        self.scale_type = ['log', 'log', 'log', 'log', 'log', 'log', 'lin', 'log', 'log']
+        self._eps = 1e-12  # numerical safety
+
+    def z_from_theta(self, theta):
+        """Map physical parameters θ -> z in [0,1]^d (log/lin per dimension)."""
+        theta = np.asarray(theta, dtype=float)
+        z = np.empty_like(theta)
+        for i, st in enumerate(self.scale_type):
+            lb, ub = self.lb[i], self.ub[i]
+            if st == 'log':
+                lb = max(lb, self._eps)
+                ub = max(ub, lb * (1.0 + 1e-12))
+                z[i] = (np.log(theta[i]) - np.log(lb)) / (np.log(ub) - np.log(lb))
+            else:  # 'lin'
+                z[i] = (theta[i] - lb) / (ub - lb)
+        return np.clip(z, 0.0, 1.0)
+
+    def theta_from_z(self, z):
+        """Map z in [0,1]^d -> physical parameters θ (log/lin per dimension)."""
+        z = np.asarray(z, dtype=float)
+        z = np.clip(z, 0.0, 1.0)
+        theta = np.empty_like(z)
+        for i, st in enumerate(self.scale_type):
+            lb, ub = self.lb[i], self.ub[i]
+            if st == 'log':
+                lb = max(lb, self._eps)
+                ub = max(ub, lb * (1.0 + 1e-12))
+                logθ = np.log(lb) + z[i] * (np.log(ub) - np.log(lb))
+                theta[i] = np.exp(logθ)
+            else:  # 'lin'
+                theta[i] = lb + z[i] * (ub - lb)
+        return theta
+
+    def objective_z(self, z):
+        """Objective in z-space: transform then reuse existing objective(θ)."""
+        theta = self.theta_from_z(z)
+        return self.objective(theta)
 
     def initial_state(self, p):#each simulation should use a new set of initial conditions
         V_sa0 = self.P_ao0 * p['C_sa']
@@ -205,61 +277,138 @@ class SubjectSimulator:
             'ED': mets['EDur']
         }
         sse = 0.0
+
+        #  (p95–p05 from your cohort)
+        K_COHORT = {
+            'bSBP': 70.60, 'bDBP': 41.30,
+            'ESV': 89.60, 'EDV': 126.90,
+            'LVOT_Flow_Peak': 157.01,
+            'ED': 0.079
+        }
+
         for key, w in self.weights.items():
-            if key == 'LVEDP':
-                continue
+            if w == 0 or key == 'LVEDP':
+                continue  # skip report-only and LVEDP (handled by prior)
+
             s_val = sim.get(key, np.nan)
             gt_val = gt.get(key, np.nan)
-            sse += w * ((s_val - gt_val)/gt_val)**2 if gt_val != 0 else 0.0
 
-        # LVEDP soft prior #change here
-        LVEDP_pred = 1.7206 * self.SWE_velocity + 8.1086 # Soft prior LVEDP - SWS Model
+            if self.loss_scaling_mode == 'cohort_minmax':
+                # --- Approach 1: cohort-based min–max (fixed K) ---
+                den = K_COHORT.get(key, 1.0)
+                sse += ((s_val - gt_val) / den) ** 2
+
+            elif self.loss_scaling_mode == 'hybrid_wls':
+                # --- Approach 2: Hybrid WLS/ELS ---
+                if key in ('bSBP', 'bDBP'):
+                    den = 5.0  # mmHg
+                elif key in ('EDV', 'ESV'):
+                    den = max(12.0, 0.10 * max(abs(gt_val), 1e-9))  # mL (hybrid)
+                elif key == 'LVOT_Flow_Peak':
+                    den = max(0.10 * abs(gt_val), 1e-9)  # 10% of GT (Doppler)
+                elif key in ('time_LVOT_Flow_Peak', 'ED'):
+                    den = 0.02  # seconds (~20 ms)
+                else:
+                    den = 1.0
+
+                sse += ((s_val - gt_val) / den) ** 2
+
+            else:
+                raise ValueError(f"Unknown loss_scaling_mode: {self.loss_scaling_mode}")
+
+        # --- LVEDP soft prior (MAP, absolute units; optional ±3 mmHg dead-zone) ---
+        LVEDP_pred = 1.7206 * self.SWE_velocity + 8.1086  # regression mean (your current model)
         LVEDP_sim = mets['LVEDP']
-        interval_LVEDP = 3  # mmHg
-            # Penalty if outside the interval:
-        if LVEDP_sim < LVEDP_pred - interval_LVEDP:
-            sse += self.soft_weight_LVEDP * ((LVEDP_sim - LVEDP_pred) ** 2 / LVEDP_pred ** 2)
-        elif LVEDP_sim > LVEDP_pred + interval_LVEDP:
-            sse += self.soft_weight_LVEDP * ((LVEDP_sim - LVEDP_pred) ** 2 / LVEDP_pred ** 2)
-            #else: No penalty if within the interval
 
-        # Penalize unphysiological LVEDP
-        if LVEDP_sim < 4 or LVEDP_sim > 35:
-            sse += self.non_phys_weight * ((LVEDP_sim - 16) ** 2 / 16 ** 2)
+        delta = LVEDP_sim - LVEDP_pred
+
+        if self.use_prior_deadzone and abs(delta) <= self.prior_deadzone:
+            prior_penalty = 0.0
+        else:
+            eff = abs(delta) - (self.prior_deadzone if self.use_prior_deadzone else 0.0)
+            prior_penalty = (eff / self.sigma_prior) ** 2  # weight = 1/sigma_prior^2 (MAP)
+
+        # Optional kappa around MAP (kept at 1.0 by default)
+        sse += self.kappa_prior * prior_penalty
+
+        # Penalize unphysiological LVEDP modified to hinge to bound method.
+        L, U = 4.0, 35.0
+        s_scale = 5.0  # or (U-L)/2 ≈ 15.5
+        viol = 0.0
+        if LVEDP_sim < L:
+            viol = (L - LVEDP_sim) / s_scale
+        elif LVEDP_sim > U:
+            viol = (LVEDP_sim - U) / s_scale
+        sse += self.lambda_phys * (viol ** 2)
         return sse
+
+        #if LVEDP_sim < 4 or LVEDP_sim > 35:
+        #    sse += self.lambda_phys * ((LVEDP_sim - 16) ** 2 / 16 ** 2)
+        #return sse
 
     # -- Objective for scipy.optimize --
     def objective(self, theta):
         return self.loss_all_matrices(theta)
 
-    # -- Run optimizer (DE + L-BFGS-B) --
+    # -- Run optimizer (DE + L-BFGS-B) in z-space, return physical x + meta --
     def optimize(self):
         np.random.seed(self.sub_id)
         t0 = time.perf_counter()
-        result_de = differential_evolution(
-            func=self.objective,
-            bounds=self.bounds,
+
+        dim = len(self.param_names)
+        unit_bounds = [(0.0, 1.0)] * dim
+
+        # ---- Differential Evolution in z-space ----
+        result_de_z = differential_evolution(
+            func=self.objective_z,
+            bounds=unit_bounds,
             workers=cpu_count(),
-            maxiter=20,
+            maxiter=25,
             popsize=5,
             tol=1e-2,
-            disp=True
+            disp=True,
+            polish=False,  # we polish ourselves
+            updating='deferred',  # better parallel behavior
+            seed=self.sub_id
         )
         t1 = time.perf_counter()
-        print(f"✓ DE complete in {t1-t0:.1f}s, best loss {result_de.fun:.6f}")
+        de_time = t1 - t0
+        de_loss = float(result_de_z.fun)
+        de_theta = self.theta_from_z(result_de_z.x)  # map to physical
+        print(f"✓ DE complete in {de_time:.1f}s, best loss {de_loss:.6f}")
+
+        # ---- L-BFGS-B in z-space ----
         print("Polishing with L-BFGS-B…")
         t2 = time.perf_counter()
-        res_local = minimize(
-            fun=self.objective,
-            x0=result_de.x,
+        res_local_z = minimize(
+            fun=self.objective_z,
+            x0=result_de_z.x,
             method='L-BFGS-B',
-            bounds=self.bounds,
+            bounds=unit_bounds,
             options={'ftol': 1e-4, 'maxiter': 100, 'disp': False}
         )
         t3 = time.perf_counter()
-        print(f"✓ L-BFGS-B complete in {t3-t2:.1f}s, final loss {res_local.fun:.6f}")
-        print(f"Total optimization time: {t3-t0:.1f}s")
-        return res_local, t3-t0
+        lbfgs_time = t3 - t2
+        lbfgs_loss = float(res_local_z.fun)
+        res_theta = self.theta_from_z(res_local_z.x)  # map to physical
+        total_time = t3 - t0
+        print(f"✓ L-BFGS-B complete in {lbfgs_time:.1f}s, final loss {lbfgs_loss:.6f}")
+        print(f"Total optimization time: {total_time:.1f}s")
+
+        # Build a SciPy-like result object with physical x for downstream code
+        class _Res: pass
+
+        res_local = _Res()
+        res_local.x = res_theta
+        res_local.fun = lbfgs_loss
+        res_local.success = True  # or res_local_z.success
+
+        # V4 meta with PHYSICAL x for DE and L-BFGS-B
+        meta = {
+            'de': {'x': de_theta, 'loss': de_loss, 'time_sec': de_time},
+            'lbfgs': {'x': res_theta, 'loss': lbfgs_loss, 'time_sec': lbfgs_time}
+        }
+        return res_local, total_time, meta
 
     def simulate_and_metrics(self, best_theta):
         """Run the simulation with best-fit parameters and extract metrics and cycle."""
@@ -368,13 +517,45 @@ class SubjectSimulator:
             print(f"{key:>22} | {s_val:10.3f} | {gt_val:10.3f}")
         return sim
 
-    def collect_result_row(self, best, loss, opt_time, sim_matrices):
-        row = {'sub_id': self.sub_id, 'loss': loss, 'optimization_time_sec': opt_time,
-               'soft_weight': self.soft_weight_LVEDP, 'phys_weight': self.non_phys_weight}
+    # CHANGE V4: add meta to capture DE/L-BFGS-B info
+    def collect_result_row(self, best, loss, opt_time, sim_matrices, meta=None):
+        row = {
+            'sub_id': self.sub_id,
+            'loss': loss,
+            'optimization_time_sec': opt_time,
+            'soft_weight': self.soft_weight_LVEDP,
+            'phys_weight': self.lambda_phys
+        }
+        # CHANGE V4: new fields (if meta is provided)
+        if meta is not None:
+            row.update({
+                'de_loss': meta['de']['loss'],
+                'de_time_sec': meta['de']['time_sec'],
+                'lbfgs_loss': meta['lbfgs']['loss'],
+                'lbfgs_time_sec': meta['lbfgs']['time_sec']
+            })
+
         for name, val in zip(self.param_names, best.x):
             row[name] = val
         row.update(sim_matrices)
         return row
+
+
+    # CHANGE V4: a separate row builder for DE-only CSV
+    def collect_de_row(self, de_x, de_loss, de_time, sim_matrices):
+        row = {
+            'sub_id': self.sub_id,
+            'de_loss': de_loss,
+            'de_time_sec': de_time,
+            'soft_weight': self.soft_weight_LVEDP,
+            'phys_weight': self.lambda_phys
+        }
+        for name, val in zip(self.param_names, de_x):
+            row[f"DE_{name}"] = val  # prefix to distinguish from final results
+        row.update({f"DE_{k}": v for k, v in sim_matrices.items()})
+        return row
+
+
 
 # -- MAIN SCRIPT --
 if __name__ == '__main__':
@@ -383,7 +564,7 @@ if __name__ == '__main__':
 
     combined_df = pd.read_csv(
         r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-        r"\3_Codes\Python\Data_Results\Invasive_Study_Leuven_GT_matrices_all_subjects.csv")
+        r"\3_Codes\Python\Data_Results\Invasive_Study_Leuven_GT_matrices_all_subjects_V4.0.csv")
     #subject_list = [316, 319, 323, 325, 326, 327, 328, 329, 331, 332, 334, 336, 337, 338, 339, 341, 342, 343,
                      #344, 346, 347, 349, 351, 352, 354, 356, 357, 359, 360, 361, 362, 363, 364, 365]# half batch run
 
@@ -395,43 +576,69 @@ if __name__ == '__main__':
                     366, 367, 368, 369, 370, 371, 372, 382, 383, 385, 386, 387, 388, 389, 390, 391, 392, 396,
                     397, 398, 399, 400, 401, 402, 403, 404, 405, 409, 410, 411, 412, 413, 414, 415] # full batch run
 
-    #subject_list = [414,415] #test33
+    #subject_list = [389,414,415] #test33
 
-    #subject_list = [410, 411, 412, 413, 414, 415] # batch 1
+    #subject_list = [316, 327, 347, 354, 356, 361,362, 363, 366, 369, 390, 392, 414] # batch 1
     #subject_list = [328, 329, 331, 332, 334, 336] # batch 2
     #subject_list = [337, 338, 339, 341, 342, 343, 344, 346, 347, 349, 351, 352] # batch 3
     #subject_list = [354, 356, 357, 359, 360, 361, 362, 363, 364, 365] # batch 4
 
     save_root = (
         r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-        r"\3_Codes\Python\Data_Results\Results_Plots_Study_27"
+        r"\3_Codes\Python\Data_Results\Results_Plots_Study_3_V4_min-max_70%_Emin"
     )
+
+    # CHANGE V4: define output CSVs (incremental append)
+    results_path_final = os.path.join(save_root, "Study_3_V4_incremental.csv")
+    results_path_deonly = os.path.join(save_root, "Study_3_V4_DE_only.csv")
+    os.makedirs(save_root, exist_ok=True)
+
     sim_results = []
+
 
     for sub_id in subject_list:
         data_row = combined_df.loc[combined_df['sub_id'] == sub_id].squeeze()
         sim = SubjectSimulator(data_row, sub_id, save_root)
-        best, opt_time = sim.optimize()
+
+        # CHANGE V4: run optimizer and get DE/L-BFGS-B meta
+        best, opt_time, meta = sim.optimize()
         print("Optimization success:", best.success)
         print("Best loss:", best.fun)
         for name, val in zip(sim.param_names, best.x):
             print(f"  {name:8s} = {val:.4f}")
 
-        # Final simulation with best-fit parameters
+        # ---- (A) DE-only simulation, metrics, and CSV append ----
+        # simulate with DE parameters (before L-BFGS-B polish)
+        t_de, P_ao_de, P_lv_de, V_lv_de, Q_sv_lv_de, Q_lv_ao_de, Q_sys_de = sim.run_simulation(
+            params={**sim.params, **{k: v for k, v in zip(sim.param_names, meta['de']['x'])}}
+        )
+        cyc_de = sim.cycle_cutting_algo(t_de, P_ao_de, P_lv_de, V_lv_de, Q_sv_lv_de, Q_lv_ao_de)
+        mets_de, _ = sim.extract_cycle_metrics(cyc_de)
+        print("\nResults after DE-only \n")
+        sim_matrices_de = sim.compare_with_gt(mets_de, cyc_de)  # prints and returns dict
+
+        row_de = sim.collect_de_row(meta['de']['x'], meta['de']['loss'], meta['de']['time_sec'], sim_matrices_de)
+        # append DE-only row
+        de_exists = os.path.exists(results_path_deonly)
+        pd.DataFrame([row_de]).to_csv(
+            results_path_deonly, mode='a', header=not de_exists, index=False
+        )
+
+        # ---- (B) Final (post L-BFGS-B) simulation, plots, and CSV append ----
         t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, params_opt = sim.simulate_and_metrics(best.x)
-        sim.plot_all(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, params_opt) # Plot all
-        sim.save_current_figures() # Save all
+
+        sim.plot_all(t, P_ao, P_lv, V_lv, Q_sv_lv, Q_lv_ao, Q_sys, cyc, mets, idxs, params_opt)  # Plot all
+        sim.save_current_figures()  # Save all
         plt.close('all')  # Close all to avoid memory leak
-
+        print("\nFinal Results after DE & L-BFGS-B\n")
         # Print metrics comparison and collect for CSV
-        sim_matrices = sim.compare_with_gt(mets, cyc)
-        row = sim.collect_result_row(best, best.fun, opt_time, sim_matrices)
-        sim_results.append(row)
+        sim_matrices_final = sim.compare_with_gt(mets, cyc)
 
-    # Save all results as a CSV
-    results_df = pd.DataFrame(sim_results)
-    results_path = os.path.join(save_root, "Study_27_410_415.csv")
-    os.makedirs(os.path.dirname(results_path), exist_ok=True)
-    results_df.to_csv(results_path, index=False)
-    print(f"\nAll subject results saved to:\n{results_path}")
+        # CHANGE V4: include DE/L-BFGS-B meta in the final row and append it
+        row_final = sim.collect_result_row(best, best.fun, opt_time, sim_matrices_final, meta=meta)
+        final_exists = os.path.exists(results_path_final)
+        pd.DataFrame([row_final]).to_csv(
+            results_path_final, mode='a', header=not final_exists, index=False
+        )
+
 #end main
