@@ -1,10 +1,15 @@
 #1. Save csv file after optimisation of each subject, and append to the file.
 #2. Save additional information - DE loss and time taken, L-BFGS-B loss and time taken
 #3. Save a csv file with optimised values and model output after DE alone for each subject.
-#4. Integrated the new params for R_sys, Z_ao and C_sa as per the KNN Virtual to Patient Matching Algo
+#4. Integrated the new params for R_sys, Z_ao and C_sa as per the KNN Virtual to Patient Matching Algo.
 #5. Modified the non_physiological range penalty to a hinge to bound method.
 #6. Fixed the SWS-LVEDP soft prior weight based on the maximum‑a‑posteriori formulation in absolute units, prior based on RMSE of the regression model.
-#7. Fixed the scaling of loss function error by physiological constants K as in Nikolai's paper and Hybrid WLS
+#7. Fixed the scaling of loss function error by physiological constants K as cohort mean as in Nikolai's paper (implimented as cohort_minmax) and Hybrid WLS
+#8. Emin is fixed before PE to the isotonic calibration self.Emin_mech_prior = data_row['Emin_isotonic_cal']
+#9. Redundant variables are removed in the loss function, added IVRT to loss function and changed ED to ET.
+#10. LVOT Flow magnitude and time of peak flow are removed from loss function.
+#11. Model params are normalized to 0,1 before optimization (z_from_thetaa, theta_from_z)
+#12. ESP and EDP are identified based on dp/dt max and maximal P/V values, as per literature - Bezy et al, Caenen et al
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -52,15 +57,19 @@ class SubjectSimulator:
         self.total = self.cycles * self.T
         self.dt = self.T / 500.0
 
+        # === Paper-aligned ED/ES definitions used in optimization ===
+        self.ED_DEF = "dpdt_upstroke"  # ED at onset of +dP/dt (ED corner)
+        self.ESP_DEF = "max_P_over_V"  # ESP at max(P/V) during ejection
+
         # Model parameter names and initial guess (for bounds)
         self.param_names = ['R_sys', 'Z_ao', 'C_sa', 'R_mv', 'E_max', 'E_min', 't_peak', 'V_tot', 'C_sv']
         self.params = {
-            'R_sys': data_row['R_sys'], #change here
-            'Z_ao': data_row['Z_ao'], #change here
-            'C_sa': data_row['C_sa'], #change here
+            'R_sys': 2.09, #'R_sys': data_row['R_sys'], #change here
+            'Z_ao': 0.06,  #'Z_ao': data_row['Z_ao'], #change here
+            'C_sa':0.68,   #'C_sa': data_row['C_sa'], #change here
             'R_mv': 0.05,
             'E_max': 5,
-            'E_min': data_row['Emin_isotonic_cal'],  #'E_min': 0.05, #change here
+            'E_min': 0.05, #'E_min': data_row['Emin_isotonic_cal'],  #'E_min': 0.05, #change here
             't_peak': 0.35,
             'V_tot': 300,
             'C_sv': 15,
@@ -68,12 +77,12 @@ class SubjectSimulator:
         }
         # Bounds for optimization (subject specific)
         self.bounds = [
-            (self.params['R_sys'] * (1 - 0.20), self.params['R_sys'] * (1 + 0.20)),#(0.5, 3.0), #change here
-            (self.params['Z_ao'] * (1 - 0.20), self.params['Z_ao'] * (1 + 0.20)),#(0.01, 1.0), #change here
-            (self.params['C_sa'] * (1 - 0.20), self.params['C_sa'] * (1 + 0.20)),#(0.5, 10.0), #change here
+            (0.5, 4.0), #(self.params['R_sys'] * (1 - 0.20), self.params['R_sys'] * (1 + 0.20)), #change here
+            (0.01, 1.0),#(self.params['Z_ao'] * (1 - 0.20), self.params['Z_ao'] * (1 + 0.20)), #change here
+            (0.1, 10.0),#(self.params['C_sa'] * (1 - 0.20), self.params['C_sa'] * (1 + 0.20)), #change here
             (0.01, 0.1),     # R_mv
             (0.9, 10.0),     # E_max
-            (self.params['E_min'] * (1 - 0.70), self.params['E_min'] * (1 + 0.70)),  # (0.01, 2.5), #change here
+            (0.01, 2.5), #(self.params['E_min'] * (1 - 0.70), self.params['E_min'] * (1 + 0.70)),   #change here
             (0.1, 0.7),      # t_peak
             (50.0, 2000),    # V_tot
             (0.5, 30.0)      # C_sv
@@ -85,10 +94,12 @@ class SubjectSimulator:
         # Metric weights for loss calculation
 
         self.weights = {
-            'EDV': 1, 'ESV': 1, 'SV': 0, 'EF': 0,  # SV/EF report-only
-            'bSBP': 1, 'bDBP': 1, 'bMAP': 0, 'bPP': 0,  # MAP/PP report-only
-            'LVOT_Flow_Peak': 1, 'time_LVOT_Flow_Peak': 1, 'ED': 1,
-            'LVEDP': 0.0  # prior handled separately
+            'EDV': 1, 'ESV': 1, 'SV': 0, 'EF': 0,
+            'bSBP': 1, 'bDBP': 1, 'bMAP': 0, 'bPP': 0,
+            'LVOT_Flow_Peak': 0, 'time_LVOT_Flow_Peak': 0,
+            'ET': 1,
+            'IVRT': 1,
+            'LVEDP': 0.0
         }
         # add a single toggle
         self.loss_scaling_mode = 'cohort_minmax' # or   'hybrid_wls'
@@ -224,31 +235,186 @@ class SubjectSimulator:
             'Q_ao': Q_lv_ao[start:end]
         }
 
+    def _cycle_period(self, t):
+        t = np.asarray(t, dtype=float)
+        dt = float(t[1] - t[0])
+        return float(t[-1] - t[0] + dt)
+
+    def _dt_cyclic(self, t1, t2, T):
+        # positive time difference with wrap-around
+        return float(t2 - t1) if t2 >= t1 else float(t2 + T - t1)
+
+    def _flow_segments(self, Q, thr_frac=0.01, abs_thr=1e-3, min_len=3):
+        Q = np.asarray(Q, dtype=float)
+        if np.max(Q) <= 0:
+            return []
+        thr = max(thr_frac * np.max(Q), abs_thr)
+        mask = Q > thr
+        if not np.any(mask):
+            return []
+        d = np.diff(mask.astype(int))
+        starts = list(np.where(d == 1)[0] + 1)
+        ends = list(np.where(d == -1)[0])
+        if mask[0]:
+            starts = [0] + starts
+        if mask[-1]:
+            ends = ends + [len(Q) - 1]
+        segs = []
+        for s, e in zip(starts, ends):
+            if e - s + 1 >= min_len:
+                segs.append((int(s), int(e)))
+        return segs
+
+    def _choose_main_segment(self, Q, segs):
+        if not segs:
+            return None, None
+        Q = np.asarray(Q, dtype=float)
+        peaks = [np.max(Q[s:e + 1]) for s, e in segs]
+        k = int(np.argmax(peaks))
+        return segs[k]
+
+    def _valve_events_from_flows(self, t, Qao, Qmv, thr_ao=0.01, thr_mv=0.005):
+        """
+        Compute AVO/AVC from aortic flow, and MVO/MVC from mitral flow.
+        Returns (avo, avc, mvo, mvc) indices. Some can be None if detection fails.
+        """
+        N = len(t)
+
+        ao_segs = self._flow_segments(Qao, thr_frac=thr_ao, min_len=3)
+        avo, avc = self._choose_main_segment(Qao, ao_segs)
+
+        mv_segs = self._flow_segments(Qmv, thr_frac=thr_mv, min_len=3)
+        if not mv_segs:
+            return avo, avc, None, None
+
+        # if no aortic events, fall back: mitral first start = MVO, last end = MVC
+        if avo is None or avc is None:
+            mvo = mv_segs[0][0]
+            mvc = mv_segs[-1][1]
+            return avo, avc, int(mvo), int(mvc)
+
+        avo_i = int(avo)
+        avc_i = int(avc)
+
+        starts = np.array([s for s, e in mv_segs], dtype=int)
+        ends = np.array([e for s, e in mv_segs], dtype=int)
+
+        # MVO: first mitral segment start AFTER AVC (cyclic)
+        starts_shift = np.where(starts >= avc_i, starts, starts + N)
+        mvo = int(starts[np.argmin(starts_shift)])
+
+        # MVC: last mitral segment end BEFORE AVO (cyclic)
+        ends_shift = np.where(ends <= avo_i, ends, ends - N)
+        mvc = int(ends[np.argmax(ends_shift)])
+
+        return avo_i, avc_i, mvo, mvc
+
+    def _idx_esp_max_P_over_V(self, P, V, avo=None, avc=None):
+        eps = 1e-6
+        ratio = P / np.maximum(V, eps)
+
+        if avo is not None and avc is not None:
+            if avc >= avo:
+                idx_range = np.arange(avo, avc + 1)
+            else:
+                idx_range = np.concatenate([np.arange(avo, len(P)), np.arange(0, avc + 1)])
+            return int(idx_range[np.argmax(ratio[idx_range])])
+
+        return int(np.argmax(ratio))
+
     def extract_cycle_metrics(self, cyc):
-        """Extract main cycle metrics from a cut cycle."""
-        t = cyc['t']
-        V = cyc['V_lv']
-        P = cyc['P_lv']
-        Q = cyc['Q_ao']
-        EDV_idx = np.argmax(V)
-        ESV_idx = np.argmin(V)
-        EDV = V[EDV_idx]
-        ESV = V[ESV_idx]
-        LVEDP = P[EDV_idx]
-        peak_idx = np.argmax(Q)
-        Q_peak = Q[peak_idx]
-        t_peak = t[peak_idx]
+        """
+        Extract main cycle metrics from a cut cycle using paper-style definitions:
+          ED  : dpdt_upstroke (onset of +dP/dt near MVC)
+          ESP : max(P/V) within ejection window (AVO->AVC if available)
+        Also computes IVRT = AVC->MVO from flows. [1](https://journals.physiology.org/doi/full/10.1152/ajpheart.00705.2019)[2](https://www.ahajournals.org/doi/pdf/10.1161/circimaging.110.961623)
+        """
+
+        t = np.asarray(cyc['t'], dtype=float)
+        V = np.asarray(cyc['V_lv'], dtype=float)
+        P = np.asarray(cyc['P_lv'], dtype=float)
+        Qao = np.asarray(cyc['Q_ao'], dtype=float)
+        Qmv = np.asarray(cyc['Q_sv'], dtype=float)
+
+        Tcyc = self._cycle_period(t)
+
+        # valve events
+        avo_idx, avc_idx, mvo_idx, mvc_idx = self._valve_events_from_flows(
+            t=t, Qao=Qao, Qmv=Qmv, thr_ao=0.01, thr_mv=0.005
+        )
+
+        # ---- ED index (dpdt_upstroke) ----
+        dPdt = np.gradient(P, t)
+
+        if self.ED_DEF == "dpdt_upstroke":
+            if mvc_idx is not None:
+                back_s = 0.25
+                dt = float(t[1] - t[0])
+                back_n = int(round(back_s / dt))
+                i0 = max(0, int(mvc_idx) - back_n)
+                i1 = int(mvc_idx)
+                d = dPdt[i0:i1 + 1]
+                crossings = np.where((d[:-1] <= 0) & (d[1:] > 0))[0] + 1
+                ED_idx = int(i0 + crossings[-1]) if len(crossings) else int(np.argmax(V))
+            else:
+                i_peak = int(np.argmax(dPdt))
+                crossings = np.where((dPdt[:-1] <= 0) & (dPdt[1:] > 0))[0] + 1
+                crossings = crossings[crossings < i_peak]
+                ED_idx = int(crossings[-1]) if len(crossings) else int(np.argmax(V))
+        else:
+            ED_idx = int(np.argmax(V))  # fallback
+
+        EDV = float(V[ED_idx])
+        LVEDP = float(P[ED_idx])
+
+        # ---- ESP/ES index (max P/V) ----
+        if self.ESP_DEF == "max_P_over_V":
+            es_idx = self._idx_esp_max_P_over_V(P, V, avo=avo_idx, avc=avc_idx)
+        else:
+            es_idx = int(np.argmin(V))  # fallback
+
+        ESP = float(P[es_idx])
+        ESV = float(V[es_idx])
+
+        # For reference (classic min-V ESV)
+        ESV_minV = float(np.min(V))
+        ESV_idx_minV = int(np.argmin(V))
+        EDV_maxV = float(np.max(V))
+
+        # ---- LVOT flow peak and time-to-peak ----
+        peak_idx = int(np.argmax(Qao))
+        Q_peak = float(Qao[peak_idx])
+        t_peak = float(t[peak_idx])
+
+        # ---- Ejection duration proxy (your old EDur) ----
         thresh = 0.01 * Q_peak
-        mask = Q > thresh
-        edur_start_idx = np.where(mask)[0][0] if mask.any() else EDV_idx
-        edur_end_idx   = np.where(mask)[0][-1] if mask.any() else EDV_idx
-        EDur = t[edur_end_idx] - t[edur_start_idx]
+        mask = Qao > thresh
+        edur_start_idx = int(np.where(mask)[0][0]) if mask.any() else ED_idx
+        edur_end_idx = int(np.where(mask)[0][-1]) if mask.any() else ED_idx
+        EDur = float(t[edur_end_idx] - t[edur_start_idx])
+
+        # ---- IVRT (AVC -> MVO) ----  [1](https://journals.physiology.org/doi/full/10.1152/ajpheart.00705.2019)[2](https://www.ahajournals.org/doi/pdf/10.1161/circimaging.110.961623)
+        if avc_idx is not None and mvo_idx is not None:
+            IVRT = self._dt_cyclic(float(t[avc_idx]), float(t[mvo_idx]), Tcyc)
+        else:
+            IVRT = np.nan
+
         return (
-            {'EDV': EDV, 'ESV': ESV, 'LVEDP': LVEDP,
-             'Q_peak': Q_peak, 't_peak': t_peak, 'EDur': EDur},
-            {'EDV_idx': EDV_idx, 'ESV_idx': ESV_idx,
-             'peak_idx': peak_idx,
-             'edur_start': edur_start_idx, 'edur_end': edur_end_idx}
+            {
+                'EDV': EDV, 'ESV': ESV, 'ESV_minV': ESV_minV, 'LVEDP': LVEDP,
+                'ESP': ESP,'EDV_maxV': EDV_maxV,
+                'Q_peak': Q_peak, 't_peak': t_peak, 'EDur': EDur,'ET': EDur,
+                'IVRT': IVRT
+            },
+            {
+                'EDV_idx': int(ED_idx),
+                'ESV_idx': int(es_idx),
+                'ESV_minV_idx': int(ESV_idx_minV),
+                'peak_idx': int(peak_idx),
+                'edur_start': int(edur_start_idx),
+                'edur_end': int(edur_end_idx),
+                'avo_idx': avo_idx, 'avc_idx': avc_idx, 'mvo_idx': mvo_idx, 'mvc_idx': mvc_idx
+            }
         )
 
     # -- Loss function used for parameter estimation --
@@ -264,57 +430,73 @@ class SubjectSimulator:
 
         # Compute the main metrics
         sim = {
-            'EDV': mets['EDV'],
-            'ESV': mets['ESV'],
-            'SV':  mets['EDV'] - mets['ESV'],
-            'EF':  (mets['EDV'] - mets['ESV'])/mets['EDV']*100 if mets['EDV'] > 0 else np.nan,
-            'bSBP': np.max(cyc['P_ao'])*1.1,
-            'bDBP': np.min(cyc['P_ao'])*1.1,
-            'bMAP': (np.max(cyc['P_ao'])*1.1 + 2*np.min(cyc['P_ao'])*1.1)/3,
-            'bPP':  np.max(cyc['P_ao'])*1.1 - np.min(cyc['P_ao'])*1.1,
+            # BEFORE:
+            # 'EDV': mets['EDV'],
+            # 'ESV': mets['ESV'],
+
+            # AFTER (robust for loss; still report paper indices elsewhere):
+            'EDV': mets.get('EDV_maxV', mets['EDV']),
+            'ESV': mets.get('ESV_minV', mets['ESV']),
+
+            'SV': mets['EDV'] - mets['ESV'],  # you can leave SV as-is (uses event ED/ES)
+            'EF': (mets['EDV'] - mets['ESV']) / mets['EDV'] * 100 if mets['EDV'] > 0 else np.nan,
+            'bSBP': np.max(cyc['P_ao']) * 1.1,
+            'bDBP': np.min(cyc['P_ao']) * 1.1,
+            'bMAP': (np.max(cyc['P_ao']) * 1.1 + 2 * np.min(cyc['P_ao']) * 1.1) / 3,
+            'bPP': np.max(cyc['P_ao']) * 1.1 - np.min(cyc['P_ao']) * 1.1,
             'LVOT_Flow_Peak': mets['Q_peak'],
             'time_LVOT_Flow_Peak': mets['t_peak'],
-            'ED': mets['EDur']
+            'ET': mets.get('ET', mets.get('EDur', np.nan)),
+            'IVRT': mets.get('IVRT', np.nan)
         }
-        sse = 0.0
-
-        #  (p95–p05 from your cohort)
+        #  (mean values of cohort)
         K_COHORT = {
-            'bSBP': 70.60, 'bDBP': 41.30,
-            'ESV': 89.60, 'EDV': 126.90,
-            'LVOT_Flow_Peak': 157.01,
-            'ED': 0.079
+            'bSBP': 138.43, 'bDBP': 75.15,
+            'ESV': 48.56, 'EDV': 97.76, 'SV': 49.29 , 'EF': 52.57,
+            'LVOT_Flow_Peak': 334.64,
+            'ET': 0.29,'time_LVOT_Flow_Peak': 0.08,
+            'IVRT': 0.1139
         }
 
+        # inside loss_all_matrices()
+        sse = 0.0
         for key, w in self.weights.items():
             if w == 0 or key == 'LVEDP':
-                continue  # skip report-only and LVEDP (handled by prior)
+                continue
 
             s_val = sim.get(key, np.nan)
             gt_val = gt.get(key, np.nan)
 
-            if self.loss_scaling_mode == 'cohort_minmax':
-                # --- Approach 1: cohort-based min–max (fixed K) ---
-                den = K_COHORT.get(key, 1.0)
-                sse += ((s_val - gt_val) / den) ** 2
+            # --- Robust guard: skip term if sim or GT is NaN/inf
+            # (Optionally, add a small constant penalty instead of skipping)
+            if not (np.isfinite(s_val) and np.isfinite(gt_val)):
+                # e.g., to force some pressure to "try" to become computable:
+                # sse += 0.5  # mild penalty
+                continue
 
+            if self.loss_scaling_mode == 'cohort_minmax':
+                den = K_COHORT.get(key, 1.0)
             elif self.loss_scaling_mode == 'hybrid_wls':
-                # --- Approach 2: Hybrid WLS/ELS ---
                 if key in ('bSBP', 'bDBP'):
-                    den = 5.0  # mmHg
+                    den = 5.0
                 elif key in ('EDV', 'ESV'):
-                    den = max(12.0, 0.10 * max(abs(gt_val), 1e-9))  # mL (hybrid)
+                    den = max(12.0, 0.10 * max(abs(gt_val), 1e-9))
                 elif key == 'LVOT_Flow_Peak':
-                    den = max(0.10 * abs(gt_val), 1e-9)  # 10% of GT (Doppler)
-                elif key in ('time_LVOT_Flow_Peak', 'ED'):
-                    den = 0.02  # seconds (~20 ms)
+                    den = max(0.10 * abs(gt_val), 1e-9)
+                elif key in ('time_LVOT_Flow_Peak', 'ET', 'IVRT'):
+                    den = 0.02
                 else:
                     den = 1.0
-
-                sse += ((s_val - gt_val) / den) ** 2
-
             else:
-                raise ValueError(f"Unknown loss_scaling_mode: {self.loss_scaling_mode}")
+                return 1e12
+
+            sse += w * ((s_val - gt_val) / den) ** 2
+
+        # Final guard so optimizer never sees NaN/inf:
+        if not np.isfinite(sse):
+            return 1e12
+
+        LVEDP_sim = mets['LVEDP']
 
         # --- LVEDP soft prior (MAP, absolute units; optional ±3 mmHg dead-zone) ---
         LVEDP_pred = 1.7206 * self.SWE_velocity + 8.1086  # regression mean (your current model)
@@ -340,11 +522,41 @@ class SubjectSimulator:
         elif LVEDP_sim > U:
             viol = (LVEDP_sim - U) / s_scale
         sse += self.lambda_phys * (viol ** 2)
+        #self._debug_loss_breakdown(sim, gt, K_COHORT)
         return sse
 
         #if LVEDP_sim < 4 or LVEDP_sim > 35:
         #    sse += self.lambda_phys * ((LVEDP_sim - 16) ** 2 / 16 ** 2)
         #return sse
+
+    def _debug_loss_breakdown(self, sim, gt, K_COHORT):
+        parts = {}
+        for key, w in self.weights.items():
+            if w == 0 or key == 'LVEDP':
+                continue
+            s_val = sim.get(key, np.nan)
+            g_val = gt.get(key, np.nan)
+            if not (np.isfinite(s_val) and np.isfinite(g_val)):
+                continue
+            if self.loss_scaling_mode == 'cohort_minmax':
+                den = K_COHORT.get(key, 1.0)
+            else:  # 'hybrid_wls'
+                if key in ('bSBP', 'bDBP'):
+                    den = 5.0
+                elif key in ('EDV', 'ESV'):
+                    den = max(12.0, 0.10 * max(abs(g_val), 1e-9))
+                elif key == 'LVOT_Flow_Peak':
+                    den = max(0.10 * abs(g_val), 1e-9)
+                elif key in ('time_LVOT_Flow_Peak', 'ET', 'IVRT'):
+                    den = 0.02
+                else:
+                    den = 1.0
+            parts[key] = ((s_val - g_val) / den) ** 2
+        # print once per subject
+        if not hasattr(self, "_loss_once"):
+            ordered = sorted(parts.items(), key=lambda kv: kv[1], reverse=True)
+            print(f"[sub {self.sub_id}] Loss breakdown (top 6): {ordered[:6]}")
+            self._loss_once = True
 
     # -- Objective for scipy.optimize --
     def objective(self, theta):
@@ -489,32 +701,57 @@ class SubjectSimulator:
     def compare_with_gt(self, mets, cyc):
         """Print and return a dictionary comparing simulated and ground-truth metrics."""
         gt = self.data_row
+
+        # Robust endpoints (what your loss uses)
+        EDV_minmax = mets.get('EDV_maxV', np.max(cyc['V_lv']))
+        ESV_minmax = mets.get('ESV_minV', np.min(cyc['V_lv']))
+        SV_minmax = EDV_minmax - ESV_minmax
+        EF_minmax = (SV_minmax / EDV_minmax * 100.0) if EDV_minmax > 0 else np.nan
+
+        # Event-based endpoints (paper-aligned ED/ES for reporting only)
+        EDV_event = mets['EDV']  # from dp/dt upstroke ED
+        ESV_event = mets['ESV']  # from max(P/V) time
+        SV_event = EDV_event - ESV_event
+        EF_event = (SV_event / EDV_event * 100.0) if EDV_event > 0 else np.nan
+
         sim = {
-            'EDV': mets['EDV'],
-            'ESV': mets['ESV'],
-            'SV':  mets['EDV'] - mets['ESV'],
-            'EF':  (mets['EDV'] - mets['ESV'])/mets['EDV']*100 if mets['EDV']>0 else np.nan,
-            'bSBP': np.max(cyc['P_ao'])*1.1,
-            'bDBP': np.min(cyc['P_ao'])*1.1,
-            'bMAP': (np.max(cyc['P_ao'])*1.1 + 2*np.min(cyc['P_ao'])*1.1)/3,
-            'bPP':  np.max(cyc['P_ao'])*1.1 - np.min(cyc['P_ao'])*1.1,
+            # --- volumes used in evaluation (min/max) ---
+            'EDV': EDV_minmax,
+            'ESV': ESV_minmax,
+            'SV': SV_minmax,
+            'EF': EF_minmax,
+
+            # --- also expose event-based for plots/diagnostics ---
+            'EDV_event': EDV_event,
+            'ESV_event': ESV_event,
+            'SV_event': SV_event,
+            'EF_event': EF_event,
+
+            # pressures & timing (unchanged)
+            'bSBP': np.max(cyc['P_ao']) * 1.1,
+            'bDBP': np.min(cyc['P_ao']) * 1.1,
+            'bMAP': (np.max(cyc['P_ao']) * 1.1 + 2 * np.min(cyc['P_ao']) * 1.1) / 3,
+            'bPP': np.max(cyc['P_ao']) * 1.1 - np.min(cyc['P_ao']) * 1.1,
             'LVOT_Flow_Peak': mets['Q_peak'],
             'time_LVOT_Flow_Peak': mets['t_peak'],
-            'ED': mets['EDur'],
+            'ET': mets.get('ET', mets.get('EDur', np.nan)),
+            'IVRT': mets.get('IVRT', np.nan),
             'LVEDP': mets['LVEDP']
         }
+
         print(f"\n--- Comparing Simulation vs. Ground-Truth for sub_id={self.sub_id} ---")
-        print(f"{'Metric':>22} | {'Sim':>10} | {'GT':>10}")
-        print('-'*46)
-        for key in [
-            'EDV','ESV','SV','EF',
-            'bSBP','bDBP','bMAP','bPP',
-            'LVOT_Flow_Peak','time_LVOT_Flow_Peak',
-            'ED','LVEDP'
-        ]:
+        # print the min/max set (what you optimize and evaluate against)
+        for key in ['EDV', 'ESV', 'SV', 'EF', 'bSBP', 'bDBP', 'bMAP', 'bPP',
+                    'LVOT_Flow_Peak', 'time_LVOT_Flow_Peak', 'ET', 'IVRT', 'LVEDP']:
             s_val = sim.get(key, np.nan)
             gt_val = gt.get(key, np.nan)
             print(f"{key:>22} | {s_val:10.3f} | {gt_val:10.3f}")
+
+        # also print event-based endpoints for reference
+        print("Event-based (paper indices) -> "
+              f"EDV_event={EDV_event:.1f}, ESV_event={ESV_event:.1f}, "
+              f"SV_event={SV_event:.1f}, EF_event={EF_event:.1f}%")
+
         return sim
 
     # CHANGE V4: add meta to capture DE/L-BFGS-B info
@@ -576,7 +813,7 @@ if __name__ == '__main__':
                     366, 367, 368, 369, 370, 371, 372, 382, 383, 385, 386, 387, 388, 389, 390, 391, 392, 396,
                     397, 398, 399, 400, 401, 402, 403, 404, 405, 409, 410, 411, 412, 413, 414, 415] # full batch run
 
-    #subject_list = [389,414,415] #test33
+    #subject_list = [327] #test33
 
     #subject_list = [316, 327, 347, 354, 356, 361,362, 363, 366, 369, 390, 392, 414] # batch 1
     #subject_list = [328, 329, 331, 332, 334, 336] # batch 2
@@ -585,12 +822,12 @@ if __name__ == '__main__':
 
     save_root = (
         r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-        r"\3_Codes\Python\Data_Results\Results_Plots_Study_3_V4_min-max_70%_Emin"
+        r"\3_Codes\Python\Data_Results\Results_Plots_Study_8_V4.1_T1"
     )
 
     # CHANGE V4: define output CSVs (incremental append)
-    results_path_final = os.path.join(save_root, "Study_3_V4_incremental.csv")
-    results_path_deonly = os.path.join(save_root, "Study_3_V4_DE_only.csv")
+    results_path_final = os.path.join(save_root, "Study_8_V4.1_incremental.csv")
+    results_path_deonly = os.path.join(save_root, "Study_8_V4.1_DE_only.csv")
     os.makedirs(save_root, exist_ok=True)
 
     sim_results = []

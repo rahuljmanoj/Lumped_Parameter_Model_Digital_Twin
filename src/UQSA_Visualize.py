@@ -1,661 +1,299 @@
 # -*- coding: utf-8 -*-
 """
-Visualize UQ + SA artifacts written by your UQ/SA runner.
-- Loads per-subject JSON/CSV outputs from UQ_SA/<sub_id> folders
-- Builds clean DataFrames (summary, Sobol, invalid-rate)
-- Makes figures and saves them to an output folder, and also shows them
+LPM_V4.1_UQSA_Visualize.py  (figure sizes in cm, combined S1/ST, fixed y-limits, TNR labels)
 
-Fixes / updates:
-- boxplot(..., tick_labels=...) to silence Matplotlib 3.9 deprecation
-- set_xticks(...) before set_xticklabels(...) to avoid warnings
+Creates:
+  1) LVEDP histogram with mean & 95% PI (styled; adjustable bin width),
+  2) Sobol bar charts with S1 and ST combined in a single axes (no CI; fixed y-cap; Times New Roman y-labels),
+  3) Scatter LVEDP vs each parameter (linear regression, R², Pearson ρ).
+
+Reads files written by your V4.1 UQSA script:
+  - <SUB_ID>_uq_lvedp.csv | _uq_samples.csv
+  - <SUB_ID>_uq_theta.csv | _uq_params.csv
+  - <SUB_ID>_uq_summary.json
+  - <SUB_ID>_sobol_lvedp.csv, <SUB_ID>_sobol_validity.csv
+  - <SUB_ID>_uqsa_conditions.csv (for parameter order)
 """
 
 import os, json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-PHYS_RANGE = (4.0, 35.0)   # used for shading/lines
-# --- CONFIG ---
-UQSA_ROOT = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Dataset_Python\Results_UQSA_Subject_Specific\UQ_SA"
-OUTDIR    = os.path.join(UQSA_ROOT, "_viz")
+from matplotlib.ticker import MaxNLocator
+
+# ====================== USER CONFIG ======================
+UQSA_ROOT = r".\Data_Results\Results_UQSA_LPM_4.1"   # <-- set to your SAVE_ROOT
+SUB_ID    = 999
+PHYS_RANGE = (4.0, 35.0)       # mmHg
+MAX_SCATTER = 5000            # downsample cap for scatter
+
+# ----------- FIGURE SIZES (in centimeters) -----------
+CM = 1.0 / 2.54  # cm -> inch
+
+# Histogram figure size (W_cm, H_cm)
+FIGSIZE_HIST_CM   = (16, 7.0)       # e.g., 24×12 cm
+
+# Sobol (combined S1+ST on one axes) figure size
+FIGSIZE_SOBOL_CM  = (16, 7.0)      # e.g., 31×12 cm
+
+# Scatter panel: either explicit figure size or per-subplot size × grid
+# Option A: fixed figure size (comment out Option B below if you prefer this)
+FIGSIZE_SCATTER_CM = (29.7, 15.0)      # A4 landscape-ish
+
+# Option B (alternative): per-subplot size in cm (used only if FIGSIZE_SCATTER_CM=None)
+SUBPLOT_W_CM, SUBPLOT_H_CM = 8.0, 6.5  # each small subplot size
+
+# Histogram binning:
+# - If HIST_BIN_WIDTH_MM is not None, it is used (larger => wider bars)
+# - Else if HIST_NBINS is not None, that exact number of bins is used
+# - Else Freedman–Diaconis
+HIST_BIN_WIDTH_MM = 0.30    # e.g., 0.10–0.20 mmHg to spread bars; set None to disable
+HIST_NBINS        = None    # or e.g., 100; keep None to use bin width or FD rule
+
+# Sobol (combined chart) options
+SOBOL_AS_PERCENT = False    # show S1/ST as 0–100%
+SOBOL_YMAX       = 0.70     # axis cap in index units (0..1). If SOBOL_AS_PERCENT=True, this means 80%
+BAR_ALPHA        = 0.88
+COLOR_S1         = "#2ca02c"
+COLOR_ST         = "#ff7f0e"
+BAR_WIDTH        = 0.38     # width for each bar; S1 left, ST right
+
+# ----- Fonts -----
+plt.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 10, "axes.labelsize":10, "axes.titlesize": 11,
+    "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.fontsize": 9,
+})
+
+# Sobol x‑axis label styling
+X_TICK_ROT_DEG = 0          # 0 = straight; use 45 if you ever want angled again
+X_TICK_HA      = "center"   # horizontal alignment: "center" | "right" | "left"
+X_TICK_PAD     = 4          # px padding between labels and axis
+
+# ---------- OUTPUT DIR ----------
+OUTDIR = os.path.join(UQSA_ROOT, str(SUB_ID), "_viz_subject")
 os.makedirs(OUTDIR, exist_ok=True)
 
-def savefig(fig, name, dpi=200):
-    path = os.path.abspath(os.path.join(OUTDIR, name))
-    fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    print(f"Saved → {path}")
+# =========================================================
 
-# -----------------------------
-# Loaders
-# -----------------------------
-def _safe_int(s):
+# Pretty labels
+PLABEL = {
+    "R_sys": r"$R_{\mathrm{sys}}$", "Z_ao": r"$Z_{\mathrm{ao}}$", "C_sa": r"$C_{\mathrm{sa}}$",
+    "R_mv": r"$R_{\mathrm{mv}}$", "E_max": r"$E_{\max}$", "E_min": r"$E_{\min}$",
+    "t_peak": r"$t_{\mathrm{peak}}$", "V_tot": r"$V_{\mathrm{tot}}$", "C_sv": r"$C_{\mathrm{sv}}$",
+}
+XLABELS = {
+    "R_sys": r"$R_{\mathrm{sys}}$ (mmHg·s/ml)",
+    "Z_ao":  r"$Z_{\mathrm{ao}}$ (mmHg·s/ml)",
+    "C_sa":  r"$C_{\mathrm{sa}}$ (ml/mmHg)",
+    "R_mv":  r"$R_{\mathrm{mv}}$ (mmHg·s/ml)",
+    "E_max": r"$E_{\max}$ (mmHg/ml)",
+    "E_min": r"$E_{\min}$ (mmHg/ml)",
+    "t_peak":r"$t_{\mathrm{peak}}$ (s)",
+    "V_tot": r"$V_{\mathrm{tot}}$ (ml)",
+    "C_sv":  r"$C_{\mathrm{sv}}$ (ml/mmHg)",
+}
+
+# ---------- LOAD ----------
+sub_dir = os.path.join(UQSA_ROOT, str(SUB_ID))
+# UQ outputs (valid-only)
+f_y_new = os.path.join(sub_dir, f"{SUB_ID}_uq_lvedp.csv")
+f_y_old = os.path.join(sub_dir, f"{SUB_ID}_uq_samples.csv")
+f_x_new = os.path.join(sub_dir, f"{SUB_ID}_uq_theta.csv")
+f_x_old = os.path.join(sub_dir, f"{SUB_ID}_uq_params.csv")
+f_sum   = os.path.join(sub_dir, f"{SUB_ID}_uq_summary.json")
+# Sobol outputs (written by producer)
+f_sa_l  = os.path.join(sub_dir, f"{SUB_ID}_sobol_lvedp.csv")
+f_sa_v  = os.path.join(sub_dir, f"{SUB_ID}_sobol_validity.csv")
+# Conditions for parameter order
+f_cond  = os.path.join(sub_dir, f"{SUB_ID}_uqsa_conditions.csv")
+
+# UQ samples
+if   os.path.isfile(f_y_new): df_y = pd.read_csv(f_y_new)
+elif os.path.isfile(f_y_old): df_y = pd.read_csv(f_y_old)
+else: raise FileNotFoundError("No LVEDP UQ samples found in subject folder.")
+
+if   os.path.isfile(f_x_new): df_x = pd.read_csv(f_x_new)
+elif os.path.isfile(f_x_old): df_x = pd.read_csv(f_x_old)
+else: raise FileNotFoundError("No UQ params/theta found in subject folder.")
+
+# parameter order (optional)
+param_order = list(df_x.columns)
+if os.path.isfile(f_cond):
     try:
-        return int(s)
+        dcond = pd.read_csv(f_cond)
+        if "param" in dcond.columns:
+            param_order = dcond["param"].tolist()
     except Exception:
-        return None
+        pass
 
-def _safe_int(s):
+# Sobol CSVs
+df_sa_l = pd.read_csv(f_sa_l) if os.path.isfile(f_sa_l) else None
+df_sa_v = pd.read_csv(f_sa_v) if os.path.isfile(f_sa_v) else None
+
+# ---------- 1) LVEDP histogram ----------
+y = df_y["LVEDP"].dropna().values
+if os.path.isfile(f_sum):
     try:
-        return int(s)
+        with open(f_sum, "r") as fp: s = json.load(fp)
+        mean = float(s.get("mean", np.mean(y)))
+        sd   = float(s.get("sd",   np.std(y, ddof=1)))
+        pi   = s.get("PI95", [np.percentile(y,2.5), np.percentile(y,97.5)])
+        lo, hi = float(pi[0]), float(pi[1])
     except Exception:
-        return None
+        mean, sd = float(np.mean(y)), float(np.std(y, ddof=1))
+        lo, hi = np.percentile(y, [2.5,97.5])
+else:
+    mean, sd = float(np.mean(y)), float(np.std(y, ddof=1))
+    lo, hi = np.percentile(y, [2.5,97.5])
 
-def load_subject_artifacts(uqsa_root):
-    rows_summary = []
-    rows_fail = []
-    sa_frames = []
+fig_histsize = (FIGSIZE_HIST_CM[0]*CM, FIGSIZE_HIST_CM[1]*CM)
+fig, ax = plt.subplots(figsize=fig_histsize)
 
-    for entry in os.scandir(uqsa_root):
-        if not entry.is_dir():
-            continue
-        sub_id = _safe_int(entry.name)
-        if sub_id is None:
-            continue
+# Compute bins
+if HIST_BIN_WIDTH_MM is not None:
+    pad = 0.02*(y.max()-y.min() if y.max()>y.min() else 1.0)
+    bins = np.arange(y.min()-pad, y.max()+pad + HIST_BIN_WIDTH_MM, HIST_BIN_WIDTH_MM)
+elif HIST_NBINS is not None:
+    bins = int(HIST_NBINS)
+else:
+    iqr = np.subtract(*np.percentile(y, [75, 25]))
+    bin_w = 2*iqr*(len(y)**(-1/3)) if iqr>0 else (np.std(y)*3.49*(len(y)**(-1/3)))
+    bins = max(30, int((y.max()-y.min())/bin_w)) if bin_w>0 else max(30, int(np.sqrt(len(y))))
 
-        folder = entry.path
+ax.hist(y, bins=bins, color="#5B6770", edgecolor="black", alpha=0.88)
+ax.axvspan(PHYS_RANGE[0], PHYS_RANGE[1], color="lightgrey", alpha=0.45, label="LVEDP Physiological Bound")
+ax.axvline(mean, color="#d62728", ls="--", lw=1.6, label=f"Mean = {mean:.1f} mmHg")
+ax.axvline(lo,   color="#1f77b4", ls=":",  lw=1.6, label=f"95% PI = {lo:.1f} mmHg")
+ax.axvline(hi,   color="#1f77b4", ls=":",  lw=1.6, label=f"95% PI = {hi:.1f} mmHg")
+ax.set_xlabel("LVEDP [mmHg]"); ax.set_ylabel("Number of samples")
+#ax.set_title(f"UQ: LVEDP distribution (sub {SUB_ID})")
+ax.legend(ncol=1, frameon=True, framealpha=0.95)
+ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
+fig.tight_layout()
+out_hist = os.path.join(OUTDIR, f"{SUB_ID}_uq_lvedp_hist.png")
+fig.savefig(out_hist, dpi=300); print(f"Saved -> {out_hist}")
 
-        # UQ files
-        f_summary = os.path.join(folder, f"{sub_id}_uq_summary.json")
-        f_uq_X    = os.path.join(folder, f"{sub_id}_uq_params.csv")
-        f_uq_inv  = os.path.join(folder, f"{sub_id}_mc_invalid_params.csv")
+# ---------- helpers ----------
+def _to_num(s):
+    try:
+        return pd.to_numeric(s, errors="coerce")
+    except Exception:
+        return pd.Series(np.nan, index=s.index)
 
-        # Sobol common params file
-        f_sa_X        = os.path.join(folder, f"{sub_id}_sobol_params.csv")
-
-        # Sobol results
-        f_sa_lvedp    = os.path.join(folder, f"{sub_id}_sobol_lvedp.csv")
-        f_sa_valid    = os.path.join(folder, f"{sub_id}_sobol_validity.csv")
-
-        # Sobol invalid param logs
-        f_sa_inv_lvedp = os.path.join(folder, f"{sub_id}_sobol_invalid_params.csv")
-        f_sa_inv_valid = os.path.join(folder, f"{sub_id}_sobol_validity_invalid_params.csv")
-
-        # ----------------- UQ summary -----------------
-        if os.path.isfile(f_summary):
-            try:
-                with open(f_summary, "r") as fp:
-                    s = json.load(fp)
-                PI95 = s.get("PI95", [np.nan, np.nan])
-                rows_summary.append({
-                    "sub_id": sub_id,
-                    "N": s.get("N", np.nan),
-                    "mean": s.get("mean", np.nan),
-                    "sd": s.get("sd", np.nan),
-                    "PI95_low": PI95[0],
-                    "PI95_high": PI95[1],
-                })
-            except Exception as e:
-                print(f"[warn] could not parse summary for {sub_id}: {e}")
-
-        # ----------------- Sobol indices -----------------
-        # LVEDP Sobol
-        if os.path.isfile(f_sa_lvedp):
-            try:
-                df_l = pd.read_csv(f_sa_lvedp)
-                if "sub_id" not in df_l.columns:
-                    df_l["sub_id"] = sub_id
-                if "metric" not in df_l.columns:
-                    df_l["metric"] = "LVEDP"
-                sa_frames.append(df_l)
-            except Exception as e:
-                print(f"[warn] could not read sobol LVEDP csv for {sub_id}: {e}")
-
-        # VALIDITY Sobol
-        if os.path.isfile(f_sa_valid):
-            try:
-                df_v = pd.read_csv(f_sa_valid)
-                if "sub_id" not in df_v.columns:
-                    df_v["sub_id"] = sub_id
-                if "metric" not in df_v.columns:
-                    df_v["metric"] = "VALIDITY"
-                sa_frames.append(df_v)
-            except Exception as e:
-                print(f"[warn] could not read sobol VALIDITY csv for {sub_id}: {e}")
-
-        # ----------------- invalid accounting: UQ -----------------
-        if os.path.isfile(f_uq_X):
-            n_all = sum(1 for _ in open(f_uq_X, "r")) - 1
-            n_bad = 0
-            if os.path.isfile(f_uq_inv):
-                try:
-                    n_bad = sum(1 for _ in open(f_uq_inv, "r")) - 1
-                except Exception:
-                    n_bad = 0
-            rows_fail.append({
-                "sub_id": sub_id,
-                "phase": "UQ",
-                "n_all": n_all,
-                "n_bad": n_bad,
-                "bad_pct": (100.0 * n_bad / n_all) if n_all > 0 else np.nan
-            })
-
-        # ----------------- invalid accounting: Sobol -----------------
-        if os.path.isfile(f_sa_X):
-            n_all_sa = sum(1 for _ in open(f_sa_X, "r")) - 1
-
-            # LVEDP
-            if os.path.isfile(f_sa_inv_lvedp):
-                try:
-                    n_bad_l = sum(1 for _ in open(f_sa_inv_lvedp, "r")) - 1
-                except Exception:
-                    n_bad_l = 0
-                rows_fail.append({
-                    "sub_id": sub_id,
-                    "phase": "SA_LVEDP",
-                    "n_all": n_all_sa,
-                    "n_bad": n_bad_l,
-                    "bad_pct": (100.0 * n_bad_l / n_all_sa) if n_all_sa > 0 else np.nan
-                })
-
-            # VALIDITY
-            if os.path.isfile(f_sa_inv_valid):
-                try:
-                    n_bad_v = sum(1 for _ in open(f_sa_inv_valid, "r")) - 1
-                except Exception:
-                    n_bad_v = 0
-                rows_fail.append({
-                    "sub_id": sub_id,
-                    "phase": "SA_VALIDITY",
-                    "n_all": n_all_sa,
-                    "n_bad": n_bad_v,
-                    "bad_pct": (100.0 * n_bad_v / n_all_sa) if n_all_sa > 0 else np.nan
-                })
-
-    # summary df
-    df_summary = (pd.DataFrame(
-        rows_summary,
-        columns=["sub_id", "N", "mean", "sd", "PI95_low", "PI95_high"]
-    ).sort_values("sub_id"))
-
-    # SA df (both metrics stacked, long format)
-    if sa_frames:
-        df_sa = pd.concat(sa_frames, ignore_index=True)
-    else:
-        df_sa = pd.DataFrame(
-            columns=["sub_id", "metric", "param",
-                     "S1", "S1_low", "S1_high",
-                     "ST", "ST_low", "ST_high"]
-        )
-    if not df_sa.empty:
-        sort_cols = [c for c in ["sub_id", "metric", "param"] if c in df_sa.columns]
-        df_sa = df_sa.sort_values(sort_cols)
-
-    # invalid accounting df
-    df_fail = (pd.DataFrame(
-        rows_fail,
-        columns=["sub_id", "phase", "n_all", "n_bad", "bad_pct"]
-    ).sort_values(["sub_id", "phase"]))
-
-    return df_summary, df_sa, df_fail
-
-
-# -----------------------------
-# Plot helpers
-# -----------------------------
-def savefig(fig, name, dpi=200):
-    path = os.path.join(OUTDIR, name)
-    fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    print(f"Saved → {path}")
-
-# 1) UQ: LVEDP mean + intervals per subject
-def plot_uq_summary(df_summary):
-    if df_summary.empty:
-        print("[plot_uq_summary] no data")
+def _plot_sobol_combined(df_sa, title, fname):
+    """Single axes with side-by-side S1 & ST bars per parameter; no CI bars; fixed y-limit; straight x labels."""
+    if df_sa is None or df_sa.empty:
+        print(f"[info] No SA data to plot for {title}")
         return
-    df = df_summary.copy()
-    df["sub_id"] = df["sub_id"].astype(int)
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    x = np.arange(len(df))
-    y = df["mean"].values
-    yerr = np.vstack([y - df["PI95_low"].values, df["PI95_high"].values - y])
+    # Enforce parameter order if present
+    if "param" in df_sa.columns:
+        df_sa = df_sa.set_index("param")
+        keep = [p for p in param_order if p in df_sa.index]
+        df_sa = df_sa.loc[keep].reset_index()
+    else:
+        df_sa = df_sa.copy()
 
-    ax.errorbar(x, y, yerr=yerr, fmt="o", capsize=4)
-    ax.axhspan(4, 35, alpha=0.07, color="gray", label="Phys. LVEDP range")
+    scale = 100.0 if SOBOL_AS_PERCENT else 1.0
+    ylab  = "Sobol index (%)" if SOBOL_AS_PERCENT else "Sobol index"
+
+    params = df_sa["param"].tolist() if "param" in df_sa.columns else [f"p{i}" for i in range(len(df_sa))]
+    S1 = _to_num(df_sa.get("S1")).values * scale
+    ST = _to_num(df_sa.get("ST")).values * scale
+
+    # Combined bars
+    x = np.arange(len(params))
+    fig_sobolsize = (FIGSIZE_SOBOL_CM[0]*CM, FIGSIZE_SOBOL_CM[1]*CM)
+    fig, ax = plt.subplots(figsize=fig_sobolsize)
+    ax.bar(x - BAR_WIDTH/2, S1, width=BAR_WIDTH, color=COLOR_S1, alpha=BAR_ALPHA, label="S1")
+    ax.bar(x + BAR_WIDTH/2, ST, width=BAR_WIDTH, color=COLOR_ST, alpha=BAR_ALPHA, label="ST")
+
+    # Straight, centered x‑tick labels in Times New Roman
     ax.set_xticks(x)
-    ax.set_xticklabels(df["sub_id"], rotation=0)
-    ax.set_ylabel("LVEDP (mmHg)")
-    ax.set_xlabel("Subject ID")
-    ax.set_title("UQ: LVEDP mean and 95% prediction interval per subject")
-    ax.legend(loc="upper left")
-    savefig(fig, "uq_lvedp_summary.png")
-
-# 2) SA: distribution of ST across subjects
-def plot_st_box(df_sa, metric="LVEDP"):
-    if df_sa.empty:
-        print("[plot_st_box] no data")
-        return
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[plot_st_box] no data for metric={metric}")
-        return
-
-    order = (df.groupby("param")["ST"].median()
-             .sort_values(ascending=False).index.tolist())
-    data = [df.loc[df["param"] == p, "ST"].dropna().values for p in order]
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.boxplot(data, tick_labels=order, showfliers=False)
-    ax.set_ylabel("Total Sobol index (ST)")
-    ax.set_title(f"Distribution of ST across subjects (metric={metric})")
-    ax.set_xticklabels(order, rotation=45, ha="right")
-    savefig(fig, f"sa_st_boxplot_{metric.lower()}.png")
-
-
-# 3) Per-subject top-k ST bars
-def plot_topk_st_per_subject(df_sa, k=3, metric="LVEDP"):
-    if df_sa.empty:
-        print("[plot_topk_st_per_subject] no data")
-        return
-
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[plot_topk_st_per_subject] no data for metric={metric}")
-        return
-
-    for sub_id, g in df.groupby("sub_id"):
-        g = g.sort_values("ST", ascending=False).head(k)
-        fig, ax = plt.subplots(figsize=(6, 4))
-        xs = np.arange(len(g))
-        ax.bar(xs, g["ST"].values)
-        ax.set_xticks(xs)
-        ax.set_xticklabels(g["param"].values, rotation=45, ha="right")
-        ax.set_ylim(0, max(1.0, g["ST"].max() * 1.1))
-        ax.set_ylabel("ST")
-        ax.set_title(f"Subject {int(sub_id)}: Top {k} ST (metric={metric})")
-        savefig(fig, f"sa_top{k}_sub_{int(sub_id)}_{metric.lower()}.png")
-
-
-# 4) Invalid-rate distributions
-def plot_invalid_rates(df_fail):
-    if df_fail.empty:
-        print("[plot_invalid_rates] no data")
-        return
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    phases = ["UQ", "SA_LVEDP", "SA_VALIDITY"]
-    boxdata = [df_fail.loc[df_fail["phase"] == ph, "bad_pct"].dropna().values for ph in phases]
-    labels = ["UQ", "SA (LVEDP)", "SA (VALIDITY)"]
-
-    # remove empty series to avoid empty boxes
-    boxdata_clean = []
-    labels_clean = []
-    for bd, lab in zip(boxdata, labels):
-        if len(bd) > 0:
-            boxdata_clean.append(bd)
-            labels_clean.append(lab)
-
-    ax.boxplot(boxdata_clean, tick_labels=labels_clean, showfliers=False)
-    ax.set_ylabel("Invalid fraction (%)")
-    ax.set_title("Invalid LVEDP / validity rate across subjects")
-    savefig(fig, "invalid_rates.png")
-
-
-# 5) Correlate per-subject invalid rate with average ST per parameter
-def plot_corr_invalid_vs_st(df_sa, df_fail, metric="LVEDP"):
-    if df_sa.empty or df_fail.empty:
-        print("[plot_corr_invalid_vs_st] no data")
-        return
-
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[plot_corr_invalid_vs_st] no SA data for metric={metric}")
-        return
-
-    mean_st = (df.groupby(["sub_id", "param"])["ST"]
-               .mean().reset_index())
-    bad = df_fail[df_fail["phase"] == "SA_LVEDP"][["sub_id", "bad_pct"]]
-
-    merged = mean_st.merge(bad, on="sub_id", how="left").dropna()
-    if merged.empty:
-        print("[plot_corr_invalid_vs_st] merged empty")
-        return
-
-    for p, g in merged.groupby("param"):
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(g["bad_pct"], g["ST"], alpha=0.7)
-        ax.set_xlabel("Invalid fraction in SA (LVEDP) (%)")
-        ax.set_ylabel("Mean ST")
-        ax.set_title(f"Param {p}: ST vs invalid fraction (metric={metric})")
-        savefig(fig, f"corr_invalid_ST_{p}_{metric.lower()}.png")
-
-
-# 6) Table-like bar plot: subject-wise ST for a few key params
-def plot_subjectwise_params(df_sa, params=("V_tot", "C_sv", "E_min"), metric="LVEDP"):
-    if df_sa.empty:
-        print("[plot_subjectwise_params] no data")
-        return
-
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    df = df[df["param"].isin(params)]
-    if df.empty:
-        print(f"[plot_subjectwise_params] selected params not found for metric={metric}")
-        return
-
-    pivot = df.pivot_table(index="sub_id", columns="param", values="ST", aggfunc="mean")
-    pivot = pivot.sort_index()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = np.arange(len(pivot))
-    width = 0.8 / len(params)
-    for i, p in enumerate(params):
-        vals = pivot[p].values
-        ax.bar(x + i * width, vals, width, label=p)
-    ax.set_xticks(x + width * (len(params) - 1) / 2)
-    ax.set_xticklabels(pivot.index.astype(int), rotation=0)
-    ax.set_ylabel("ST")
-    ax.set_title(f"Subject-wise ST for selected parameters (metric={metric})")
-    ax.legend()
-    savefig(fig, f"sa_subjectwise_key_params_{metric.lower()}.png")
-
-
-def fig_uq_and_invalid(df_summary, df_fail):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-
-    # (A) UQ summary
-    ax = axes[0]
-    if not df_summary.empty:
-        df = df_summary.copy()
-        df["sub_id"] = df["sub_id"].astype(int)
-        x = np.arange(len(df))
-        y = df["mean"].values
-        yerr = np.vstack([y - df["PI95_low"].values, df["PI95_high"].values - y])
-        ax.errorbar(x, y, yerr=yerr, fmt="o", capsize=4)
-        ax.axhspan(4, 35, alpha=0.08, color="gray", label="Phys. LVEDP range")
-        ax.set_xticks(x)
-        ax.set_xticklabels(df["sub_id"], rotation=0)
-        ax.set_ylabel("LVEDP (mmHg)")
-        ax.set_xlabel("Subject ID")
-        ax.set_title("UQ: LVEDP mean ± 95% PI")
-        ax.legend(loc="upper left")
-    else:
-        ax.text(0.5, 0.5, "No UQ summary", ha="center")
-
-    # (B) Invalid rate boxplot
-    ax = axes[1]
-    if not df_fail.empty:
-        boxdata = [
-            df_fail.loc[df_fail["phase"]=="UQ", "bad_pct"].dropna().values,
-            df_fail.loc[df_fail["phase"]=="SA", "bad_pct"].dropna().values
-        ]
-        bp = ax.boxplot(boxdata, showfliers=False)
-        ax.set_xticks([1,2])
-        ax.set_xticklabels(["UQ", "SA"])
-        ax.set_ylabel("Invalid fraction (%)")
-        ax.set_title("Invalid LVEDP rates")
-    else:
-        ax.text(0.5, 0.5, "No invalid-rate data", ha="center")
-
-    savefig(fig, "fig_01_uq_invalid.png")
-
-def fig_sobol_overview(df_sa, key_params=("V_tot", "C_sv", "E_min"), metric="LVEDP"):
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    # (A) ST distribution across subjects
-    ax = axes[0]
-    if not df.empty:
-        order = (df.groupby("param")["ST"].median()
-                 .sort_values(ascending=False).index.tolist())
-        data = [df.loc[df["param"] == p, "ST"].dropna().values for p in order]
-        ax.boxplot(data, tick_labels=order, showfliers=False)
-        ax.set_ylabel("Total Sobol index (ST)")
-        ax.set_title(f"ST across subjects (metric={metric})")
-        ax.set_xticklabels(order, rotation=45, ha="right")
-    else:
-        ax.text(0.5, 0.5, f"No SA data (metric={metric})", ha="center")
-
-    # (B) Subjectwise ST bars for key params
-    ax = axes[1]
-    sub = df[df["param"].isin(key_params)].copy()
-    if not sub.empty:
-        pivot = sub.pivot_table(index="sub_id", columns="param", values="ST", aggfunc="mean")
-        pivot = pivot.sort_index()
-        x = np.arange(len(pivot))
-        width = 0.8 / len(key_params)
-        for i, p in enumerate(key_params):
-            vals = pivot[p].values
-            ax.bar(x + i * width, vals, width, label=p)
-        ax.set_xticks(x + width * (len(key_params) - 1) / 2)
-        ax.set_xticklabels(pivot.index.astype(int))
-        ax.set_ylabel("ST")
-        ax.set_title(f"Subject-wise ST for key parameters (metric={metric})")
-        ax.legend()
-    else:
-        ax.text(0.5, 0.5, "Selected params not found", ha="center")
-
-    savefig(fig, f"fig_02_sobol_overview_{metric.lower()}.png")
-
-
-def fig_topk_grid(df_sa, k=3, cols=4, metric="LVEDP"):
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[fig_topk_grid] no SA data for metric={metric}")
-        return
-
-    subjects = sorted(df["sub_id"].unique())
-    rows = int(np.ceil(len(subjects) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows), squeeze=False)
-
-    for i, sub_id in enumerate(subjects):
-        r, c = divmod(i, cols)
-        ax = axes[r][c]
-        g = (df[df["sub_id"] == sub_id]
-             .sort_values("ST", ascending=False).head(k))
-        xs = np.arange(len(g))
-        ax.bar(xs, g["ST"].values)
-        ax.set_xticks(xs)
-        ax.set_xticklabels(g["param"].values, rotation=45, ha="right")
-        ax.set_ylim(0, max(1.0, g["ST"].max() * 1.1))
-        ax.set_title(f"Sub {int(sub_id)}", fontsize=10)
-
-    for j in range(i + 1, rows * cols):
-        r, c = divmod(j, cols)
-        axes[r][c].axis("off")
-
-    fig.suptitle(f"Top-{k} ST per subject (metric={metric})", y=0.995)
-    savefig(fig, f"fig_03_topk_per_subject_{metric.lower()}.png")
-
-
-def fig_s1_st_distributions(df_sa, metric="LVEDP"):
-    if df_sa.empty:
-        print("[fig_s1_st_distributions] no SA data")
-        return
-
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[fig_s1_st_distributions] no SA data for metric={metric}")
-        return
-
-    need = {"param", "S1", "ST"}
-    if not need.issubset(df.columns):
-        print("[fig_s1_st_distributions] missing columns:", need - set(df.columns))
-        return
-
-    df["int_mass"] = df["ST"] - df["S1"]
-
-    order = (df.groupby("param")["ST"].median()
-               .sort_values(ascending=False).index.tolist())
-
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-
-    # (A) S1 boxplots
-    ax = axes[0]
-    data_s1 = [df.loc[df["param"] == p, "S1"].dropna().values for p in order]
-    ax.boxplot(data_s1, tick_labels=order, showfliers=False)
-    ax.set_title(f"Main effects (S1) across subjects (metric={metric})")
-    ax.set_ylabel("S1")
-    ax.set_xticklabels(order, rotation=45, ha="right")
-
-    # (B) ST boxplots
-    ax = axes[1]
-    data_st = [df.loc[df["param"] == p, "ST"].dropna().values for p in order]
-    ax.boxplot(data_st, tick_labels=order, showfliers=False)
-    ax.set_title("Total effects (ST) across subjects")
-    ax.set_ylabel("ST")
-    ax.set_xticklabels(order, rotation=45, ha="right")
-
-    # (C) Interaction mass
-    ax = axes[2]
-    data_int = [df.loc[df["param"] == p, "int_mass"].dropna().values for p in order]
-    ax.boxplot(data_int, tick_labels=order, showfliers=False)
-    ax.axhline(0, linestyle="--", linewidth=1)
-    ax.set_title("Interaction / nonlinearity (ST − S1)")
-    ax.set_ylabel("ST − S1")
-    ax.set_xticklabels(order, rotation=45, ha="right")
-
-    fig.suptitle(f"Sobol indices across subjects (metric={metric})", y=0.98)
-    savefig(fig, f"fig_04_s1_st_distributions_{metric.lower()}.png")
-
-
-def _ensure_dir(path):
-    if path and not os.path.isdir(path):
-        os.makedirs(path, exist_ok=True)
-
-def plot_pi_width_boxplot(df_summary: pd.DataFrame, out_dir=None, show=True):
-    """
-    Boxplot of 95% PI width across subjects.
-    """
-    _ensure_dir(out_dir)
-    df = df_summary.copy()
-    df["PI_width"] = df["PI95_high"] - df["PI95_low"]
-
-    plt.figure(figsize=(6, 5))
-    plt.boxplot(df["PI_width"].values, showfliers=False)
-    plt.ylabel("95% PI width of LVEDP (mmHg)")
-    plt.title("Uncertainty across subjects (PI width)")
-    plt.grid(True, axis="y", alpha=0.3)
-
-    if out_dir:
-        plt.savefig(os.path.join(out_dir, "uq_pi_width_boxplot.png"), dpi=300, bbox_inches="tight")
-    if show:
-        plt.show()
-    else:
-        plt.close()
-def plot_population_histogram(df_summary: pd.DataFrame, out_dir=None, show=True, bins=15):
-    """
-    Histogram of subject mean LVEDP with physiological band.
-    """
-    _ensure_dir(out_dir)
-    means = df_summary["mean"].values
-
-    plt.figure(figsize=(7, 5))
-    plt.hist(means, bins=bins, edgecolor="black", alpha=0.8)
-    plt.axvspan(PHYS_RANGE[0], PHYS_RANGE[1], color="gray", alpha=0.15, label="Phys. LVEDP range")
-    plt.axvline(12, linestyle="--", alpha=0.6, label="~Upper normal (≈12 mmHg)")
-    plt.axvline(16, linestyle="--", alpha=0.6, label="Often used elevated cutoff (≈16 mmHg)")
-    plt.xlabel("Mean LVEDP (mmHg)")
-    plt.ylabel("Number of subjects")
-    plt.title("Population distribution of mean LVEDP")
-    plt.legend(loc="upper right")
-    plt.grid(True, axis="y", alpha=0.3)
-
-    if out_dir:
-        plt.savefig(os.path.join(out_dir, "uq_population_hist_mean.png"), dpi=300, bbox_inches="tight")
-    if show:
-        plt.show()
-    else:
-        plt.close()
-
-
-def plot_uq_sa_joint(df_summary: pd.DataFrame, df_sa: pd.DataFrame,
-                     out_dir=None, show=True, top_k=4, metric="LVEDP"):
-    _ensure_dir(out_dir)
-    df = df_sa.copy()
-    if "metric" in df.columns:
-        df = df[df["metric"] == metric]
-    if df.empty:
-        print(f"[plot_uq_sa_joint] no SA data for metric={metric}")
-        return
-
-    w = df_summary[["sub_id", "PI95_low", "PI95_high"]].copy()
-    w["PI_width"] = w["PI95_high"] - w["PI95_low"]
-
-    rank = (df.groupby("param", as_index=False)["ST"]
-            .median()
-            .sort_values("ST", ascending=False))
-    keep = rank.head(top_k)["param"].tolist()
-
-    n = len(keep)
-    cols = min(3, n)
-    rows = int(np.ceil(n / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows), squeeze=False)
-
-    for i, p in enumerate(keep):
-        r, c = divmod(i, cols)
-        ax = axes[r][c]
-        d = (df[df["param"] == p][["sub_id", "ST"]]
-             .merge(w[["sub_id", "PI_width"]], on="sub_id", how="inner"))
-
-        if len(d) == 0:
-            ax.set_title(f"{p} (no data)")
-            ax.axis("off")
-            continue
-
-        ax.scatter(d["ST"], d["PI_width"], alpha=0.75)
-        if len(d) >= 2 and np.isfinite(d["ST"]).all() and np.isfinite(d["PI_width"]).all():
-            m, b = np.polyfit(d["ST"].values, d["PI_width"].values, deg=1)
-            xs = np.linspace(d["ST"].min(), d["ST"].max(), 100)
-            ax.plot(xs, m * xs + b, linestyle="--", linewidth=1)
-
-        ax.set_xlabel("Total-effect index ST")
-        ax.set_ylabel("95% PI width (mmHg)")
-        ax.set_title(f"UQ vs SA driver: {p} (metric={metric})")
-        ax.grid(True, alpha=0.3)
-
-    for j in range(i + 1, rows * cols):
-        r, c = divmod(j, cols)
-        axes[r][c].axis("off")
-
-    fig.suptitle("Uncertainty width vs SA drivers (LVEDP)", y=1.02, fontsize=14)
-    plt.tight_layout()
-
-    if out_dir:
-        plt.savefig(os.path.join(out_dir, f"uq_sa_joint_scatter_{metric.lower()}.png"),
-                    dpi=300, bbox_inches="tight")
-    if show:
-        plt.show()
-    else:
-        plt.close()
-
-
-# -----------------------------
-# Main
-# -----------------------------
-if __name__ == "__main__":
-    df_summary, df_sa, df_fail = load_subject_artifacts(UQSA_ROOT)
-    OUT_DIR = os.path.join(UQSA_ROOT, "_figs")
-
-    print("summary shape:", df_summary.shape, "| columns:", list(df_summary.columns))
-    print("sobol   shape:", df_sa.shape, "| columns:", list(df_sa.columns))
-    print("fail    shape:", df_fail.shape, "| columns:", list(df_fail.columns))
-
-    plot_uq_summary(df_summary)
-    plot_invalid_rates(df_fail)
-
-    fig_sobol_overview(df_sa, key_params=("V_tot", "C_sv", "E_min"), metric="LVEDP")
-    fig_topk_grid(df_sa, k=3, cols=4, metric="LVEDP")
-    fig_s1_st_distributions(df_sa, metric="LVEDP")
-    plot_pi_width_boxplot(df_summary, out_dir=OUT_DIR, show=True)
-    plot_population_histogram(df_summary, out_dir=OUT_DIR, show=True, bins=15)
-    plot_uq_sa_joint(df_summary, df_sa, out_dir=OUT_DIR, show=True, top_k=4, metric="LVEDP")
-
-    plt.show()
-
+    tick_texts = [PLABEL.get(p, p) for p in params]
+    ax.set_xticklabels(tick_texts)  # set first, then style
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(X_TICK_ROT_DEG)          # <-- 0° = straight
+        lbl.set_horizontalalignment(X_TICK_HA)    # <-- center
+        lbl.set_fontfamily("Times New Roman")     # explicit TNR
+    ax.tick_params(axis="x", pad=X_TICK_PAD)
+
+    # Y‑axis label + ticks in Times New Roman
+    ax.set_ylabel(ylab, fontfamily="Times New Roman")
+    for lab in ax.get_yticklabels():
+        lab.set_fontfamily("Times New Roman")
+
+    # Fixed y-limit with gentle headroom if exceeded
+    cap = SOBOL_YMAX * (100.0 if SOBOL_AS_PERCENT else 1.0)
+    max_val = np.nanmax([np.nanmax(S1), np.nanmax(ST)])
+    if np.isfinite(max_val) and max_val > cap:
+        cap = min((100.0 if SOBOL_AS_PERCENT else 1.0), max_val * 1.05)
+    ax.set_ylim(0, cap)
+
+    #ax.grid(axis="y", alpha=0.25)
+    #ax.set_title(title)
+    ax.legend(ncol=2, frameon=False)
+
+    # Slightly increase bottom margin since labels are now horizontal but centered
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.12)
+    outp = os.path.join(OUTDIR, fname)
+    fig.savefig(outp, dpi=300)
+    print(f"Saved -> {outp}")
+
+# ---------- 2) Sobol bar charts (combined S1+ST) ----------
+_plot_sobol_combined(df_sa_l, f"Sobol – LVEDP (sub {SUB_ID})", f"{SUB_ID}_sa_lvedp_combined.png")
+_plot_sobol_combined(df_sa_v, f"Sobol – VALIDITY (sub {SUB_ID})", f"{SUB_ID}_sa_validity_combined.png")
+
+# ---------- 3) Scatter: LVEDP vs each parameter ----------
+# Downsample for very large N
+if len(df_x) > MAX_SCATTER:
+    idx = np.random.default_rng(0).choice(len(df_x), size=MAX_SCATTER, replace=False)
+    X = df_x.iloc[idx].reset_index(drop=True)
+    Y = df_y.iloc[idx].reset_index(drop=True)
+else:
+    X, Y = df_x.copy(), df_y.copy()
+
+params = [p for p in param_order if p in X.columns]
+
+# Figure size for scatter
+if FIGSIZE_SCATTER_CM is not None:
+    fig_sc_size = (FIGSIZE_SCATTER_CM[0]*CM, FIGSIZE_SCATTER_CM[1]*CM)
+else:
+    # Compute from per-subplot size & grid
+    n_cols = 3
+    n_rows = int(np.ceil(len(params)/n_cols))
+    W = n_cols * SUBPLOT_W_CM
+    H = n_rows * SUBPLOT_H_CM
+    fig_sc_size = (W*CM, H*CM)
+
+# If explicit size is set, choose grid to fit
+n_cols = 3
+n_rows = int(np.ceil(len(params)/n_cols))
+fig, axes = plt.subplots(n_rows, n_cols, figsize=fig_sc_size)
+axes = axes.flatten()
+
+for i, p in enumerate(params):
+    ax = axes[i]
+    xv = X[p].values.astype(float)
+    yv = Y["LVEDP"].values.astype(float)
+    # linear regression
+    mlin, blin = np.polyfit(xv, yv, 1)
+    r = np.corrcoef(xv, yv)[0,1]; r2 = r*r
+    ax.scatter(xv, yv, s=6, alpha=0.55, edgecolors="none", color="dimgray")
+    xp = np.linspace(np.min(xv), np.max(xv), 120)
+    ax.plot(xp, mlin*xp + blin, color="#d62728", lw=1.5)
+    ax.set_xlabel(XLABELS.get(p, p)); ax.set_ylabel("LVEDP [mmHg]")
+    ax.set_title(f"{PLABEL.get(p,p)}  (R²={r2:.2f}, ρ={r:.2f})")
+    ax.grid(alpha=0.2)
+
+# remove extra axes if any
+for j in range(i+1, len(axes)):
+    fig.delaxes(axes[j])
+
+fig.suptitle(f"LVEDP vs Parameters (sub {SUB_ID})", y=0.98)
+fig.tight_layout(rect=[0.02, 0.05, 0.98, 0.95])
+out_sc = os.path.join(OUTDIR, f"{SUB_ID}_scatter_LVEDP_vs_params.png")
+fig.savefig(out_sc, dpi=300); print(f"Saved -> {out_sc}")
+plt.show()

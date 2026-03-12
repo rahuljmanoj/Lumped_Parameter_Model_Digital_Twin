@@ -1,278 +1,217 @@
+# -*- coding: utf-8 -*-
+"""
+LVEDP analysis: regressions, cross-validation, ROC & classification metrics,
+and Bland–Altman plots (console + figures).
+
+Edits requested:
+- Console shows explicit 'Sensitivity' term (in addition to Recall/TPR).
+- Console prints full Bland–Altman stats (bias, SD, LoA, CIs, proportional bias).
+- Legends in plots are commented out/disabled.
+- Figure sizes controlled in cm; Times New Roman styling.
+
+Author: Rahul Manoj (organized)
+"""
+
+import os
+import numpy as np
 import pandas as pd
-import numpy as np
-from sklearn.metrics import roc_curve, auc, confusion_matrix
+import matplotlib.pyplot as plt
+
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
-import statsmodels.api as sm
-
-from scipy.stats import pearsonr
-from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.model_selection import KFold, cross_val_score
-from scipy.stats import pearsonr, ttest_rel
-import os
-import matplotlib.pyplot as plt
-import os
+from sklearn.metrics import (
+    r2_score, roc_curve, auc, confusion_matrix,
+    accuracy_score, f1_score, precision_score, recall_score,
+    matthews_corrcoef, balanced_accuracy_score, average_precision_score,
+    cohen_kappa_score
+)
 
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+from scipy.stats import pearsonr, ttest_rel, t, linregress
+
+
+# ============================== CONFIG =======================================
+
+# Paths
 FIG_SAVE_DIR = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Figure_Results_V4.1"
-os.makedirs(FIG_SAVE_DIR, exist_ok=True)
+EXCEL_PATH   = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx"
+SHEET_NAME   = "Study_3_V4.1_T6"
+HEADER_ROW   = 3
+NROWS        = 68
 
-# ----- Load Excel file -----
-excel_path = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx"
-sheet_name = "Study_3_V4.1_T6"
-df = pd.read_excel(excel_path, sheet_name=sheet_name, header=3, nrows=68)
+# Columns
+SIM_COL  = 'sim LVEDP (LPM) (mmHg)'     # Simulated LVEDP
+PRED_COL = 'pred LVEDP (UVR) (mmHg)'    # UVR regression-predicted LVEDP
+GT_COL   = 'GT LVEDP (mmHg)'            # Ground truth LVEDP
+SWE_COL  = 'SWS (m/s)'                  # SWE velocity
+X_FEATURES = ['SWS (m/s)', 'GT bMAP (mmHg)']  # features for linear model(s)
 
-# ----- Select columns -----
-sim_col = 'sim LVEDP (LPM) (mmHg)'    # Simulated LVEDP
-pred_col = 'pred LVEDP (UVR) (mmHg)'  # Regression-predicted LVEDP from SWE
-gt_col  = 'GT LVEDP (mmHg)'     # Ground-truth LVEDP
-swe_col = 'SWS (m/s)'       # SWE velocity
+# Classification threshold(s)
+LVEDP_THRESHOLD = 16.0  # mmHg
+# SWE mapping to 16 mmHg: LVEDP ≈ a*SWE + b
+A_SWE_TO_LVEDP = 2.4033
+B_SWE_TO_LVEDP = 6.3966
 
-#X = df[['SWS (m/s)']]  # adjust column names
-X = df[['SWS (m/s)', 'GT bMAP (mmHg)']]  # adjust column names
-y = df['GT LVEDP (mmHg)']
-# 2. Standardize X
-X_std = pd.DataFrame(StandardScaler().fit_transform(X), columns=X.columns)
+# Cross-validation
+N_SPLITS = 5
+CV_RANDOM_STATE = 42
 
-# 3. Fit a linear model on the raw data (for R²)
-model = LinearRegression()
-model.fit(X, y)
-y_pred = model.predict(X)
-print (df[['SWS (m/s)', 'GT bMAP (mmHg)']].corr())
-print(f"Raw-data R²: {r2_score(y, y_pred):.3f}")
+# Figure sizes (centimeters)
+CM = 1.0 / 2.54
+FIGSIZE_REG_CM = (8.0, 5.0)
+FIGSIZE_BOX_CM = (8.0, 5.0)
+FIGSIZE_ROC_CM = (8.0, 5.0)
+FIGSIZE_BA_CM  = (8.0, 5.0)
 
-# 4. Fit OLS on the standardized data (to get standardized betas)
-Xs = sm.add_constant(X)
-ols_std = sm.OLS(y, Xs).fit()
+# Matplotlib style (Times New Roman)
+FONT_FAMILY = "Times New Roman"
+FONT_SIZE   = 9
 
-print("\nStandardized-beta OLS results:")
-print(ols_std.summary())
+# Export classification table?
+SAVE_CLASSIF_TABLE = True
+CLASSIF_TABLE_NAME = "classification_metrics_summary.csv"
 
-# 5. Compute VIFs on the original X to check collinearity
-print("Columns used for VIF:", X.columns)
-vif_df = pd.DataFrame({
-    'Variable': X.columns,
-    'VIF': [variance_inflation_factor(X.values, i)
-            for i in range(X.shape[1])]
-})
-vif_std = pd.DataFrame({
-    'Variable': X_std.columns,
-    'VIF': [variance_inflation_factor(X_std.values, i)
-            for i in range(X_std.shape[1])]
-})
+# ============================================================================
 
-print("\nVariance Inflation Factors:")
-print(vif_df)
-print("\nVariance Inflation Factors after scaling:")
-print(vif_std)
-print(np.corrcoef(X.values.T))
 
-cv = KFold(n_splits=5, shuffle=True, random_state=42)
-y = df['GT LVEDP (mmHg)']
+# ============================ UTILITIES =====================================
 
-def style_axes(ax, xlabel, ylabel, add_legend=False):
-    """Apply common formatting: Times New Roman, 9 pt, black, no grid, no title."""
-    ax.set_xlabel(xlabel, fontname="Times New Roman", fontsize=9, color="black")
-    ax.set_ylabel(ylabel, fontname="Times New Roman", fontsize=9, color="black")
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-    ax.tick_params(axis='both', labelsize=9, colors="black")
+
+def fig_size_cm(w_cm: float, h_cm: float):
+    return (w_cm * CM, h_cm * CM)
+
+
+def style_axes(ax, xlabel: str, ylabel: str, add_legend: bool = False):
+    """
+    Times New Roman styling + clean axes.
+    NOTE: Legends are disabled by default (add_legend=False).
+    """
+    ax.set_xlabel(xlabel, fontname=FONT_FAMILY, fontsize=FONT_SIZE, color="black")
+    ax.set_ylabel(ylabel, fontname=FONT_FAMILY, fontsize=FONT_SIZE, color="black")
+    ax.tick_params(axis='both', labelsize=FONT_SIZE, colors="black")
     for lbl in ax.get_xticklabels():
-        lbl.set_fontname("Times New Roman")
+        lbl.set_fontname(FONT_FAMILY)
     for lbl in ax.get_yticklabels():
-        lbl.set_fontname("Times New Roman")
-
+        lbl.set_fontname(FONT_FAMILY)
+    # Legends intentionally suppressed unless explicitly enabled
     if add_legend:
-        leg = ax.legend(fontsize=9, frameon=False)
+        leg = ax.legend(fontsize=FONT_SIZE, frameon=False)
         for txt in leg.get_texts():
-            txt.set_fontname("Times New Roman")
+            txt.set_fontname(FONT_FAMILY)
             txt.set_color("black")
-
-    ax.grid(False)        # no grid
-    ax.set_title("")      # no title
-
-
-def cv_score(X):
-    return cross_val_score(LinearRegression(), X, y,
-                           cv=cv, scoring='r2').mean()
-
-X2 = df[['SWS (m/s)', 'GT bMAP (mmHg)']]
-#X3 = df[['SWS (m/s)', 'GT bMAP (mmHg)', 'LAVI (ml/m²)']]
-
-print("2-var CV R²:", cv_score(X2))
-#print("3-var CV R²:", cv_score(X3))
+    ax.grid(False)
+    ax.set_title("")
 
 
+def correlation_print(df: pd.DataFrame, cols: list):
+    """Print Pearson correlations of selected columns."""
+    print("\n=== Pearson Correlations among predictors ===")
+    print(df[cols].corr())
 
 
-df = df.dropna(subset=[sim_col, pred_col, gt_col, swe_col])
-
-sim_lvedp  = df[sim_col].values
-pred_lvedp = df[pred_col].values
-gt_lvedp   = df[gt_col].values
-swe_vals   = df[swe_col].values
-
-# ----- Paired, two tailed t test: GT vs simulated LVEDP -----
-t_stat, p_val = ttest_rel(gt_lvedp, sim_lvedp)
-
-print("\nPaired t test: GT LVEDP vs sim LVEDP (LPM)")
-print(f"  n           = {len(gt_lvedp)}")
-print(f"  mean(GT)    = {np.mean(gt_lvedp):.2f} mmHg")
-print(f"  mean(sim)   = {np.mean(sim_lvedp):.2f} mmHg")
-print(f"  t statistic = {t_stat:.3f}")
-print(f"  p value     = {p_val:.3g}")  # two sided by default
-# -------------------------------------------------------------
-
-# ----- Regression plot: GT LVEDP vs sim LVEDP -----
-x = gt_lvedp.reshape(-1, 1)
-y = sim_lvedp
-
-reg = LinearRegression()
-reg.fit(x, y)
-y_fit = reg.predict(x)
-slope = reg.coef_[0]
-intercept = reg.intercept_
-r2 = r2_score(y, y_fit)
-
-fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-
-# scatter as black "*"
-ax.scatter(gt_lvedp, sim_lvedp, s=10, marker='*', color='orange')
-
-# regression line as dashed black
-x_line = np.linspace(gt_lvedp.min(), gt_lvedp.max(), 100).reshape(-1, 1)
-y_line = reg.predict(x_line)
-ax.plot(x_line, y_line, linestyle='--', linewidth=0.75, color='black')
-ax.set_xlim(5, 40)
-ax.set_ylim(5, 40)
-ax.set_xticks(np.arange(5, 41, 5))
-ax.set_yticks(np.arange(5, 41, 5))
-style_axes(ax, "GT LVEDP [mmHg]", "LPM-deived LVEDP [mmHg]", add_legend=False)
-#fig.tight_layout()
-
-#plt.tight_layout()
-reg_path = os.path.join(FIG_SAVE_DIR, "Fig1_regression_GT_vs_Sim_LVEDP.png")
-fig.savefig(reg_path, dpi=300, bbox_inches='tight')
-print(f"Saved: {reg_path}")
-plt.close(fig)
-
-# ----- Boxplot: GT vs Sim LVEDP -----
-fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-ax.boxplot([gt_lvedp, sim_lvedp], labels=["GT", "LPM"])
-style_axes(ax, "", "LVEDP [mmHg]", add_legend=False)
-ax.set_ylim(5, 40)
-ax.set_yticks(np.arange(5, 41, 5))
-#plt.tight_layout()
-box1_path = os.path.join(FIG_SAVE_DIR, "Fig2_box_GT_vs_Sim_LVEDP.png")
-fig.savefig(box1_path, dpi=300, bbox_inches='tight')
-print(f"Saved: {box1_path}")
-plt.close(fig)
-
-# ----- Boxplot: GT vs Sim vs UVR LVEDP -----
-fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-ax.boxplot([gt_lvedp, sim_lvedp, pred_lvedp], labels=["GT", "LPM", "UVR"])
-style_axes(ax, "", "LVEDP [mmHg]", add_legend=False)
-ax.set_ylim(5, 40)
-ax.set_yticks(np.arange(5, 41, 5))
-#plt.tight_layout()
-
-box2_path = os.path.join(FIG_SAVE_DIR, "Fig3_box_GT_vs_Sim_vs_UVR_LVEDP.png")
-fig.savefig(box2_path, dpi=300, bbox_inches='tight')
-print(f"Saved: {box2_path}")
-plt.close(fig)
+def vif_table(X: pd.DataFrame, name: str):
+    """Compute VIFs for each column of X (no constant)."""
+    vifs = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+    out = pd.DataFrame({'Variable': X.columns, 'VIF': vifs})
+    print(f"\nVariance Inflation Factors ({name}):")
+    print(out)
+    return out
 
 
-threshold = 16
-gt_elevated = (gt_lvedp >= threshold).astype(int)
-
-# ---- Calculate SWE velocity threshold corresponding to 16 mmHg ----
-a = 2.4033
-b = 6.3966
-swe_thresh = (threshold - b) / a
-print(f"SWE threshold for LVEDP=16 mmHg: {swe_thresh:.2f} m/s")
-
-# ---- CORRELATION ----
-for name, arr in [("sim LVEDP (LPM) (mmHg)", sim_lvedp), ("pred LVEDP (mmHg)", pred_lvedp), ("SWE Velocity", swe_vals)]:
-    r, p = pearsonr(arr, gt_lvedp)
-    print(f"{name} vs GT LVEDP: Correlation r = {r:.2f}, p = {p:.3g}")
-
-# ---- ROC & AUC Analysis ----
-roc_data = []
-for name, pred in [
-        ("sim LVEDP (LPM) (mmHg)", sim_lvedp),
-        ("pred LVEDP (mmHg)", pred_lvedp),
-        ("SWE Velocity", swe_vals)]:
-    fpr, tpr, thresholds = roc_curve(gt_elevated, pred)
-    auc_score = auc(fpr, tpr)
-    # Best threshold by Youden's J (not for SWE plot in paper, but for info)
-    j_scores = tpr - fpr
-    ix = np.argmax(j_scores)
-    best_thresh = thresholds[ix]
-    # For paper, use 16 mmHg (for LVEDP), SWE threshold for SWE
-    if name == "SWE Velocity":
-        cutoff = swe_thresh
-    else:
-        cutoff = threshold
-    pred_class = (pred >= cutoff).astype(int)
-    cm = confusion_matrix(gt_elevated, pred_class)
-    tn, fp, fn, tp = cm.ravel()
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
-    roc_data.append((name, fpr, tpr, auc_score, cutoff, sensitivity, specificity))
-    print(f"\n{name} ROC:")
-    print(f"  AUC: {auc_score:.2f}")
-    print(f"  Sensitivity @ cutoff {cutoff:.2f}: {sensitivity:.2f}")
-    print(f"  Specificity @ cutoff {cutoff:.2f}: {specificity:.2f}")
-
-# ---- Plot all three ROC curves together ----
-# ---- ROC plots with standard formatting ----
-
-# 5) ROC: combined Sim LVEDP + UVR LVEDP
-fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-for name, fpr, tpr, auc_score, cutoff, sensitivity, specificity in roc_data:
-    if name in ("sim LVEDP (LPM) (mmHg)", "pred LVEDP (mmHg)"):
-        ax.plot(fpr, tpr, label=f'{name} (AUC = {auc_score:.2f})', linewidth=1)
-ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
-style_axes(ax, "1 - Specificity", "Sensitivity", add_legend=False)
-plt.tight_layout()
-roc_comb_path = os.path.join(FIG_SAVE_DIR, "Fig4_ROC_Sim_plus_UVR_LVEDP.png")
-fig.savefig(roc_comb_path, dpi=300, bbox_inches='tight')
-print(f"Saved: {roc_comb_path}")
-plt.close(fig)
-
-# 6) ROC: Sim LVEDP alone
-fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-for name, fpr, tpr, auc_score, cutoff, sensitivity, specificity in roc_data:
-    if name == "sim LVEDP (LPM) (mmHg)":
-        ax.plot(fpr, tpr, label=f'{name} (AUC = {auc_score:.2f})', linewidth=1)
-ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
-style_axes(ax, "1 - Specificity", "Sensitivity", add_legend=False)
-plt.tight_layout()
-roc_sim_path = os.path.join(FIG_SAVE_DIR, "Fig5_ROC_Sim_LVEDP_only.png")
-fig.savefig(roc_sim_path, dpi=300, bbox_inches='tight')
-print(f"Saved: {roc_sim_path}")
-plt.close(fig)
+def cv_r2(X: pd.DataFrame, y: pd.Series, n_splits: int, random_state: int = 42):
+    """Return mean CV R² for a linear regression."""
+    cv = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    score = cross_val_score(LinearRegression(), X, y, cv=cv, scoring='r2').mean()
+    return score
 
 
+def compute_swe_threshold(lvedp_cut: float, a: float, b: float) -> float:
+    return (lvedp_cut - b) / a
 
-# ====== Bland–Altman Utils ======
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.stats import t, linregress
+
+# ====================== CLASSIFICATION METRICS ===============================
+
+def classification_report_at_cutoff(y_true_bin: np.ndarray,
+                                    scores_cont: np.ndarray,
+                                    cutoff: float,
+                                    label: str) -> dict:
+    """
+    Compute and print a comprehensive classification report at a fixed cutoff.
+    Works with continuous 'scores_cont' (mmHg/m/s).
+    Prints explicit 'Sensitivity' line in addition to Recall/TPR.
+    """
+    y_true_bin = np.asarray(y_true_bin, int)
+    scores_cont = np.asarray(scores_cont, float)
+
+    y_pred_bin = (scores_cont >= cutoff).astype(int)
+
+    # Confusion matrix
+    tn, fp, fn, tp = confusion_matrix(y_true_bin, y_pred_bin).ravel()
+    n = tn + fp + fn + tp
+
+    def _safe(num, den): return float(num) / den if den > 0 else np.nan
+
+    sensitivity = _safe(tp, tp + fn)   # recall/TPR
+    specificity = _safe(tn, tn + fp)   # TNR
+    precision   = _safe(tp, tp + fp)   # PPV
+    npv         = _safe(tn, tn + fn)   # NPV
+    fpr         = _safe(fp, fp + tn)
+    fnr         = 1.0 - sensitivity
+    fdr         = _safe(fp, tp + fp)   # 1 - precision
+    _for        = _safe(fn, fn + tn)   # "FOR"
+
+    acc     = accuracy_score(y_true_bin, y_pred_bin)
+    f1      = f1_score(y_true_bin, y_pred_bin, zero_division=0)
+    bal_acc = balanced_accuracy_score(y_true_bin, y_pred_bin)
+    mcc     = matthews_corrcoef(y_true_bin, y_pred_bin) if (tp+fp)*(tp+fn)*(tn+fp)*(tn+fn) > 0 else np.nan
+    kappa   = cohen_kappa_score(y_true_bin, y_pred_bin)
+
+    # Curves with continuous scores
+    fpr_curve, tpr_curve, _ = roc_curve(y_true_bin, scores_cont)
+    auroc = auc(fpr_curve, tpr_curve)
+    ap    = average_precision_score(y_true_bin, scores_cont)  # PR-AUC
+
+    # Print nicely (with an explicit Sensitivity line)
+    print(f"\n{label} @ cutoff = {cutoff:.2f}")
+    print(f"  Confusion matrix (tn fp / fn tp): [[{tn:3d} {fp:3d}] / [{fn:3d} {tp:3d}]]")
+    print(f"  Accuracy          : {acc:.3f}")
+    print(f"  Precision (PPV)   : {precision:.3f}    NPV  : {npv:.3f}")
+    print(f"  Sensitivity       : {sensitivity:.3f}")  # <-- explicit term
+    print(f"  Recall (TPR)      : {sensitivity:.3f}    Specificity (TNR): {specificity:.3f}")
+    print(f"  F1-score          : {f1:.3f}    BalAcc: {bal_acc:.3f}    MCC: {mcc:.3f}    κ: {kappa:.3f}")
+    print(f"  FPR               : {fpr:.3f}   FNR: {fnr:.3f}   FDR: {fdr:.3f}   FOR: {_for:.3f}")
+    print(f"  AUROC             : {auroc:.3f}  PR-AUC (AP): {ap:.3f}")
+
+    return {
+        "model": label, "cutoff": float(cutoff),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp), "n": int(n),
+        "accuracy": float(acc), "precision": float(precision), "recall": float(sensitivity),
+        "specificity": float(specificity), "f1": float(f1), "balanced_acc": float(bal_acc),
+        "npv": float(npv), "mcc": float(mcc), "kappa": float(kappa),
+        "fpr": float(fpr), "fnr": float(fnr), "fdr": float(fdr), "for": float(_for),
+        "auroc": float(auroc), "pr_auc": float(ap)
+    }
+
+
+# ======================= BLAND–ALTMAN TOOLS ==================================
 
 def _coerce_numeric_pair(a: np.ndarray, b: np.ndarray):
-    """Return aligned numeric arrays with NaNs removed (pairwise)."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     mask = np.isfinite(a) & np.isfinite(b)
     return a[mask], b[mask]
 
+
 def bland_altman_stats(a, b):
     """
-    Compute Bland–Altman stats:
-      bias ± 1.96*SD (LoA) and 95% CIs for bias and LoA (Bland & Altman 1999).
-    Returns dict with keys:
-      n, mean, diff, bias, sd, loa_low, loa_high, ci_bias, ci_loa_low, ci_loa_high,
-      prop_bias: {slope, intercept, pval, r}
+    Bland–Altman stats with 95% LoA and their CIs (Bland & Altman, 1999).
+    Returns dict containing arrays + scalars + CI bounds + proportional bias test.
     """
     a, b = _coerce_numeric_pair(a, b)
     mean = (a + b) / 2.0
@@ -283,17 +222,13 @@ def bland_altman_stats(a, b):
         raise ValueError("Not enough paired points for Bland–Altman (need n ≥ 3).")
 
     bias = np.mean(diff)
-    sd = np.std(diff, ddof=1)
-
-    # 95% Limits of Agreement
-    z = 1.96
-    loa_low = bias - z * sd
+    sd   = np.std(diff, ddof=1)
+    z    = 1.96
+    loa_low  = bias - z * sd
     loa_high = bias + z * sd
 
-    # CIs (Bland & Altman, 1999):
-    #   CI for bias: bias ± t_{n-1,0.975} * SD/sqrt(n)
-    #   CI for LoA: LoA ± t_{n-1,0.975} * SD * sqrt(1/n + z^2/(2*(n-1)))
-    tcrit = t.ppf(0.975, df=n-1)
+    # 95% CIs (Bland & Altman, 1999)
+    tcrit  = t.ppf(0.975, df=n-1)
     se_bias = sd / np.sqrt(n)
     ci_bias = (bias - tcrit * se_bias, bias + tcrit * se_bias)
 
@@ -301,7 +236,7 @@ def bland_altman_stats(a, b):
     ci_loa_low  = (loa_low  - tcrit * se_loa, loa_low  + tcrit * se_loa)
     ci_loa_high = (loa_high - tcrit * se_loa, loa_high + tcrit * se_loa)
 
-    # Proportional bias: diff ~ mean (simple linear regression)
+    # Proportional bias: diff ~ mean
     lr = linregress(mean, diff)
     prop_bias = dict(slope=lr.slope, intercept=lr.intercept, pval=lr.pvalue, r=lr.rvalue)
 
@@ -312,14 +247,32 @@ def bland_altman_stats(a, b):
         prop_bias=prop_bias
     )
 
-def plot_bland_altman(
-    stats_dict, title="", x_label="Mean of methods", y_label="Difference (A - B)",
-    point_alpha=0.8, annotate=True, save_name=None
-):
-    """
-    Render a single Bland–Altman plot using stats from bland_altman_stats().
-    If save_name is given, saves PNG into FIG_SAVE_DIR.
-    """
+
+def print_ba_summary(stats_dict: dict, label: str):
+    """Nicely print BA stats to console."""
+    n       = stats_dict["n"]
+    bias    = stats_dict["bias"]
+    sd      = stats_dict["sd"]
+    loa_low = stats_dict["loa_low"]
+    loa_high= stats_dict["loa_high"]
+    ci_bias = stats_dict["ci_bias"]
+    ci_ll   = stats_dict["ci_loa_low"]
+    ci_lh   = stats_dict["ci_loa_high"]
+    prop    = stats_dict["prop_bias"]
+
+    print(f"\n=== Bland–Altman Summary: {label} ===")
+    print(f"  n           : {n}")
+    print(f"  Bias        : {bias:.3f}   (95% CI {ci_bias[0]:.3f} to {ci_bias[1]:.3f})")
+    print(f"  SD          : {sd:.3f}")
+    print(f"  LoA         : {loa_low:.3f} to {loa_high:.3f}")
+    print(f"  LoA 95% CI  : low {ci_ll[0]:.3f} to {ci_ll[1]:.3f} | high {ci_lh[0]:.3f} to {ci_lh[1]:.3f}")
+    print(f"  Prop. bias  : slope={prop['slope']:.4f}, intercept={prop['intercept']:.4f}, "
+          f"p={prop['pval']:.3g}, r={prop['r']:.3f}")
+
+
+def plot_bland_altman(stats_dict, title="", x_label="Mean of methods",
+                      y_label="Difference (A - B)", save_path=None):
+    """BA plot without legend (as requested)."""
     mean = stats_dict["mean"]
     diff = stats_dict["diff"]
     bias = stats_dict["bias"]
@@ -328,12 +281,9 @@ def plot_bland_altman(
     ci_bias = stats_dict["ci_bias"]
     ci_loa_low = stats_dict["ci_loa_low"]
     ci_loa_high = stats_dict["ci_loa_high"]
-    n = stats_dict["n"]
-    prop = stats_dict["prop_bias"]
 
-    fig, ax = plt.subplots(figsize=(7/2.54, 5/2.54), dpi=300)
-
-    ax.scatter(mean, diff, s=12, alpha=point_alpha, edgecolor='none')
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_BA_CM), dpi=300)
+    ax.scatter(mean, diff, s=12, alpha=0.8, edgecolor='none')
 
     ax.axhline(bias, color='k', linestyle='-', linewidth=1.0)
     ax.axhline(loa_low, color='k', linestyle='--', linewidth=0.9)
@@ -343,69 +293,197 @@ def plot_bland_altman(
     ax.fill_between([np.min(mean), np.max(mean)], ci_loa_low[0], ci_loa_low[1], alpha=0.08)
     ax.fill_between([np.min(mean), np.max(mean)], ci_loa_high[0], ci_loa_high[1], alpha=0.08)
 
-    if annotate:
-        txt = (
-            f"n = {n}\n"
-            f"Bias = {bias:.2f} (95% CI {ci_bias[0]:.2f} to {ci_bias[1]:.2f})\n"
-            f"LoA = {loa_low:.2f} to {loa_high:.2f}\n"
-            f"Prop. bias: slope={prop['slope']:.3f}, p={prop['pval']:.3g}"
-        )
-        ax.text(
-            0.02, 0.98, txt, transform=ax.transAxes,
-            va='top', ha='left', fontsize=7,
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.75, linewidth=0.5)
-        )
-
-    style_axes(ax, x_label, y_label, add_legend=False)
+    style_axes(ax, x_label, y_label, add_legend=False)   # legend disabled
     ax.set_xlim(5, 35)
     ax.set_ylim(-15, 15)
     ax.set_xticks(np.arange(5, 36, 5))
     ax.set_yticks(np.arange(-15, 16, 5))
     fig.tight_layout()
 
-    if save_name is not None:
-        ba_path = os.path.join(FIG_SAVE_DIR, save_name)
-        fig.savefig(ba_path, dpi=300, bbox_inches='tight')
-        print(f"Saved: {ba_path}")
-
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_path}")
     plt.close(fig)
 
 
+# =============================== MAIN ========================================
 
-def run_bland_altman(df, col_A, col_B, label_A=None, label_B=None, save_name=None):
-    """
-    Convenience wrapper to compute + plot BA between two dataframe columns.
-    """
-    if label_A is None: label_A = col_A
-    if label_B is None: label_B = col_B
-    a = df[col_A].values
-    b = df[col_B].values
-    stats_d = bland_altman_stats(a, b)
-    title = f"{label_A} vs {label_B}"
-    plot_bland_altman(
-        stats_d, title=title,
-        x_label=f" ",
-        y_label=f" ",
-        save_name=save_name
-    )
-    return stats_d
+def main():
+    ensure_dir(FIG_SAVE_DIR)
+
+    # ----- Load data -----
+    df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=HEADER_ROW, nrows=NROWS)
+
+    # For modeling with X features (raw + standardized)
+    X = df[X_FEATURES].copy()
+    y = df[GT_COL].copy()
+
+    # Drop NaNs for modeling subset
+    model_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    X = X.loc[model_mask].copy()
+    y = y.loc[model_mask].copy()
+
+    # Standardize X
+    X_std = pd.DataFrame(StandardScaler().fit_transform(X), columns=X.columns, index=X.index)
+
+    # ----- Basic linear regression & OLS -----
+    model = LinearRegression()
+    model.fit(X, y)
+    y_pred = model.predict(X)
+    print("\n=== Linear model (raw) ===")
+    correlation_print(df, X_FEATURES)
+    print(f"Raw-data R²: {r2_score(y, y_pred):.3f}")
+
+    # OLS on raw X (with constant)
+    Xs = sm.add_constant(X)
+    ols = sm.OLS(y, Xs).fit()
+    print("\nOLS results (raw features):")
+    print(ols.summary())
+
+    # ----- VIF -----
+    _ = vif_table(X, name="raw X")
+    _ = vif_table(X_std, name="standardized X")
+
+    # ----- Cross-validation R² -----
+    cv_r2_val = cv_r2(X, y, n_splits=N_SPLITS, random_state=CV_RANDOM_STATE)
+    print(f"\n{len(X_FEATURES)}-var CV R² (LinearRegression, {N_SPLITS}-fold): {cv_r2_val:.3f}")
+
+    # ----- Prepare arrays for downstream analyses -----
+    required_cols = [SIM_COL, PRED_COL, GT_COL, SWE_COL]
+    df2 = df.dropna(subset=required_cols).copy()
+
+    sim_lvedp  = df2[SIM_COL].to_numpy(float)
+    pred_lvedp = df2[PRED_COL].to_numpy(float)
+    gt_lvedp   = df2[GT_COL].to_numpy(float)
+    swe_vals   = df2[SWE_COL].to_numpy(float)
+
+    # ----- Paired t-test: GT vs simulated LVEDP -----
+    t_stat, p_val = ttest_rel(gt_lvedp, sim_lvedp)
+    print("\n=== Paired t-test: GT LVEDP vs Sim LVEDP (LPM) ===")
+    print(f"  n           = {len(gt_lvedp)}")
+    print(f"  mean(GT)    = {np.mean(gt_lvedp):.2f} mmHg")
+    print(f"  mean(Sim)   = {np.mean(sim_lvedp):.2f} mmHg")
+    print(f"  t statistic = {t_stat:.3f}")
+    print(f"  p value     = {p_val:.3g}")
+
+    # ----- Regression plot: GT vs Sim -----
+    x = gt_lvedp.reshape(-1, 1)
+    y_sim = sim_lvedp
+    reg = LinearRegression().fit(x, y_sim)
+    y_fit = reg.predict(x)
+
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_REG_CM), dpi=300)
+    ax.scatter(gt_lvedp, sim_lvedp, s=10, marker='*', color='orange')
+    x_line = np.linspace(gt_lvedp.min(), gt_lvedp.max(), 100).reshape(-1, 1)
+    y_line = reg.predict(x_line)
+    ax.plot(x_line, y_line, linestyle='--', linewidth=0.75, color='black')
+    ax.set_xlim(5, 40); ax.set_ylim(5, 40)
+    ax.set_xticks(np.arange(5, 41, 5)); ax.set_yticks(np.arange(5, 41, 5))
+    style_axes(ax, "GT LVEDP [mmHg]", "LPM-derived LVEDP [mmHg]", add_legend=False)  # legend disabled
+    reg_path = os.path.join(FIG_SAVE_DIR, "Fig1_regression_GT_vs_Sim_LVEDP.png")
+    fig.savefig(reg_path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    print(f"Saved: {reg_path}")
+    print(f"Regression (GT→Sim): slope={reg.coef_[0]:.3f}, intercept={reg.intercept_:.3f}, R²={r2_score(y_sim, y_fit):.3f}")
+
+    # ----- Boxplots -----
+    # GT vs Sim
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_BOX_CM), dpi=300)
+    ax.boxplot([gt_lvedp, sim_lvedp], labels=["GT", "LPM"])
+    style_axes(ax, "", "LVEDP [mmHg]", add_legend=False)  # legend disabled
+    ax.set_ylim(5, 40); ax.set_yticks(np.arange(5, 41, 5))
+    box1_path = os.path.join(FIG_SAVE_DIR, "Fig2_box_GT_vs_Sim_LVEDP.png")
+    fig.savefig(box1_path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    print(f"Saved: {box1_path}")
+
+    # GT vs Sim vs UVR
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_BOX_CM), dpi=300)
+    ax.boxplot([gt_lvedp, sim_lvedp, pred_lvedp], labels=["GT", "LPM", "UVR"])
+    style_axes(ax, "", "LVEDP [mmHg]", add_legend=False)  # legend disabled
+    ax.set_ylim(5, 40); ax.set_yticks(np.arange(5, 41, 5))
+    box2_path = os.path.join(FIG_SAVE_DIR, "Fig3_box_GT_vs_Sim_vs_UVR_LVEDP.png")
+    fig.savefig(box2_path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    print(f"Saved: {box2_path}")
+
+    # ----- Correlations vs GT -----
+    print("\n=== Correlations vs GT LVEDP ===")
+    for name, arr in [(SIM_COL, sim_lvedp), (PRED_COL, pred_lvedp), ("SWE Velocity", swe_vals)]:
+        r, p = pearsonr(arr, gt_lvedp)
+        print(f"{name:>24}: r = {r:.2f}, p = {p:.3g}")
+
+    # ----- ROC & AUC + Full Classification Metrics at fixed cutoffs -----
+    gt_elevated = (gt_lvedp >= LVEDP_THRESHOLD).astype(int)
+    swe_thresh = compute_swe_threshold(LVEDP_THRESHOLD, A_SWE_TO_LVEDP, B_SWE_TO_LVEDP)
+    print(f"\nSWE threshold for LVEDP={LVEDP_THRESHOLD:.0f} mmHg: {swe_thresh:.2f} m/s")
+
+    # Build ROC data for plots (AUROC) and print Youden info
+    roc_data = []
+    for name, scores in [(SIM_COL, sim_lvedp), (PRED_COL, pred_lvedp), ("SWE Velocity", swe_vals)]:
+        fpr, tpr, thr = roc_curve(gt_elevated, scores)
+        auc_score = auc(fpr, tpr)
+        j_scores = tpr - fpr
+        ix = np.argmax(j_scores)
+        best_thr = thr[ix]
+        roc_data.append((name, fpr, tpr, auc_score))
+
+        print(f"\n{name} ROC:")
+        print(f"  AUROC        : {auc_score:.3f}")
+        print(f"  Youden J max : {j_scores[ix]:.3f} at threshold={best_thr:.3f}")
+
+    # Classification metrics table at fixed cutoffs (16 mmHg / SWE-threshold)
+    metrics_rows = []
+    for name, scores in [(SIM_COL, sim_lvedp), (PRED_COL, pred_lvedp), ("SWE Velocity", swe_vals)]:
+        cutoff = swe_thresh if name == "SWE Velocity" else LVEDP_THRESHOLD
+        row = classification_report_at_cutoff(gt_elevated, scores, cutoff, name)
+        metrics_rows.append(row)
+
+    metrics_df = pd.DataFrame(metrics_rows)
+    print("\n===== Classification summary (fixed cutoffs) =====")
+    print(metrics_df[[
+        "model","cutoff","accuracy","precision","recall","specificity",
+        "f1","balanced_acc","npv","mcc","kappa","auroc","pr_auc"
+    ]].to_string(index=False))
+
+    if SAVE_CLASSIF_TABLE:
+        out_csv = os.path.join(FIG_SAVE_DIR, CLASSIF_TABLE_NAME)
+        metrics_df.to_csv(out_csv, index=False)
+        print(f"Saved: {out_csv}")
+
+    # ----- Plot ROC curves (no legends) -----
+    # Combined (Sim + UVR)
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_ROC_CM), dpi=300)
+    for name, fpr, tpr, auc_score in roc_data:
+        if name in (SIM_COL, PRED_COL):
+            ax.plot(fpr, tpr, linewidth=1.0)  # label suppressed; legend disabled
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
+    style_axes(ax, "1 - Specificity", "Sensitivity", add_legend=False)  # legend disabled
+    roc_comb_path = os.path.join(FIG_SAVE_DIR, "Fig4_ROC_Sim_plus_UVR_LVEDP.png")
+    fig.savefig(roc_comb_path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    print(f"Saved: {roc_comb_path}")
+
+    # Sim only
+    fig, ax = plt.subplots(figsize=fig_size_cm(*FIGSIZE_ROC_CM), dpi=300)
+    for name, fpr, tpr, auc_score in roc_data:
+        if name == SIM_COL:
+            ax.plot(fpr, tpr, linewidth=1.0)  # label suppressed; legend disabled
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
+    style_axes(ax, "1 - Specificity", "Sensitivity", add_legend=False)  # legend disabled
+    roc_sim_path = os.path.join(FIG_SAVE_DIR, "Fig5_ROC_Sim_LVEDP_only.png")
+    fig.savefig(roc_sim_path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    print(f"Saved: {roc_sim_path}")
+
+    # ----- Bland–Altman plots + console summaries -----
+    # (A) UVR vs GT
+    ba_uvr = bland_altman_stats(pred_lvedp, gt_lvedp)
+    print_ba_summary(ba_uvr, label="UVR vs GT")
+    ba_uvr_path = os.path.join(FIG_SAVE_DIR, "Fig6_BA_UVR_vs_GT.png")
+    plot_bland_altman(ba_uvr, title="UVR vs GT", x_label="", y_label="", save_path=ba_uvr_path)
+
+    # (B) Sim vs GT
+    ba_sim = bland_altman_stats(sim_lvedp, gt_lvedp)
+    print_ba_summary(ba_sim, label="Sim vs GT")
+    ba_sim_path = os.path.join(FIG_SAVE_DIR, "Fig7_BA_Sim_vs_GT.png")
+    plot_bland_altman(ba_sim, title="Sim vs GT", x_label="", y_label="", save_path=ba_sim_path)
 
 
-# ====== USAGE: choose your BA pairs ======
-# Examples below assume the variables sim_col, pred_col, gt_col, swe_col already exist
-# (as in your current script). Typically BA should compare the *same units/methods*,
-# e.g., predicted LVEDP vs ground-truth LVEDP, or simulated vs ground-truth.
-#
-# Define the pairs you want to analyze and plot:
-ba_pairs = [
-    (pred_col, gt_col, "Fig6_BA_UVR_vs_GT.png"),
-    (sim_col,  gt_col, "Fig7_BA_Sim_vs_GT.png"),
-]
-
-for A, B, fname in ba_pairs:
-    print(f"\n=== Bland–Altman: {A} vs {B} ===")
-    ba_stats = run_bland_altman(df, A, B, label_A=A, label_B=B, save_name=fname)
-
-
-
-
+if __name__ == "__main__":
+    main()
