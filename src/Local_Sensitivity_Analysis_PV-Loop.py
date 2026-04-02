@@ -1884,9 +1884,9 @@ class SubjectSimulator:
         fig_w, fig_h = figsize_cm[0] / 2.54, figsize_cm[1] / 2.54
         fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
         ax = fig.add_subplot(111)
-        ax.set_xlim(20, 80)
+        ax.set_xlim(20, 90)
         ax.set_ylim(0, 150)
-        ax.set_xticks(np.arange(20, 81, 10))
+        ax.set_xticks(np.arange(20, 91, 10))
         ax.set_yticks(np.arange(0, 151, 20))
 
         # --- PV family in gray ---
@@ -2444,8 +2444,8 @@ class SubjectSimulator:
 
     def plot_pv_loop_with_valve_events(self, cyc, HR_bpm=None, save_path=None, show=False,
                                        dpi=600, figsize_cm=(6, 6),
-                                       xlim=(20, 80), xtick_step=10,
-                                       ylim=(0, 140), ytick_step=20):
+                                       xlim=(20, 90), xtick_step=10,
+                                       ylim=(0, 150), ytick_step=20):
         """
         PV loop figure with:
           - ED point (EDV, EDP) and ES point (ESV, ESP)
@@ -2777,9 +2777,9 @@ class SubjectSimulator:
         fig = plt.figure(figsize=(figsize_cm[0] / 2.54, figsize_cm[1] / 2.54), dpi=dpi)
 
         ax = fig.add_subplot(111)
-        ax.set_xlim(40, 80)
+        ax.set_xlim(40, 90)
         ax.set_ylim(1500, 4000)
-        ax.set_xticks(np.arange(40, 81, 10))
+        ax.set_xticks(np.arange(40, 91, 10))
         ax.set_yticks(np.arange(1500, 4001, 500))
 
         # points
@@ -2821,43 +2821,36 @@ import os
 def _preafter_paramsets(sim):
     b = sim.params.copy()
 
-    # Stronger preload modulation
+    # Preload modulation
     preload_inc = {
-        'V_tot': b['V_tot'] * 1.20,   # was 1.20
-        'C_sv' : b['C_sv']  * 1.20,   # was 1.20
-        'R_mv' : b['R_mv']  * 0.85    # was 0.85
+        'V_tot': b['V_tot'] * 1.20,
+        'C_sv' : b['C_sv']  * 1.20,
+        'R_mv' : b['R_mv']  * 0.85
     }
     preload_dec = {
-        'V_tot': b['V_tot'] * 0.75,   # was 0.75
-        'C_sv' : b['C_sv']  * 0.70,   # was 0.70
-        'R_mv' : b['R_mv']  * 1.20    # was 1.20
+        'V_tot': b['V_tot'] * 0.75,
+        'C_sv' : b['C_sv']  * 0.70,
+        'R_mv' : b['R_mv']  * 1.20
     }
 
-    # Keep afterload as you had
-    after_inc =  {'R_sys': b['R_sys'] * 1.35, 'C_sa': b['C_sa'] * 0.65, 'Z_ao': b['Z_ao'] * 1.20}
-    after_dec =  {'R_sys': b['R_sys'] * 0.70, 'C_sa': b['C_sa'] * 1.30, 'Z_ao': b['Z_ao'] * 0.80}
-
-
-    '''# Strong physiological AFTERLOAD changes (aortic occlusion / vasodilation)
-    after_inc =  {
-        'R_sys': b['R_sys'] * 2.50,
-        'C_sa' : b['C_sa']  * 0.30,
-        'Z_ao' : b['Z_ao']  * 2.00
+    # Afterload modulation
+    after_inc = {
+        'R_sys': b['R_sys'] * 1.35,
+        'C_sa' : b['C_sa']  * 0.65,
+        'Z_ao' : b['Z_ao']  * 1.20
     }
-    after_dec =  {
-        'R_sys': b['R_sys'] * 0.30,
-        'C_sa' : b['C_sa']  * 2.00,
-        'Z_ao' : b['Z_ao']  * 0.30
+    after_dec = {
+        'R_sys': b['R_sys'] * 0.70,
+        'C_sa' : b['C_sa']  * 1.30,
+        'Z_ao' : b['Z_ao']  * 0.80
     }
-
 
     return {
         'preload_increase': preload_inc,
         'preload_decrease': preload_dec,
         'afterload_increase': after_inc,
         'afterload_decrease': after_dec
-    }'''
-
+    }
 
 def _single_cycle_full_metrics(sim, cyc, params):
     """
@@ -3069,13 +3062,6 @@ def run_preafter_save_full(sim,
     plt.close()
     print(f"[pre/after FULL] Saved overlay figure → {out_fig}")
 
-
-
-
-
-
-
-
 # -- MAIN SCRIPT --
 if __name__ == '__main__':
     combined_GT_df = pd.read_csv(
@@ -3084,11 +3070,11 @@ if __name__ == '__main__':
 
     save_root = (
         r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-        r"\3_Codes\Python\Data_Results\PV_LOOP_Analysis_Pre_Afterload_Figures_V4.1_V2"
+        r"\3_Codes\Python\Data_Results\Figures_V4\PV_LOOP_999"
     )
     excel_path = (r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
                   r"\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx")
-    sheet_name = "Study_3_V4.1_T6"
+    sheet_name = "Study_9_V4.1_T7"
     combined_df = pd.read_excel(excel_path, sheet_name=sheet_name, header=3, nrows=69)
 
     #subject_list = [316, 319, 323, 325, 326, 327, 328, 329, 331, 332, 334, 336, 337, 338, 339, 341, 342, 343,
@@ -3145,7 +3131,7 @@ if __name__ == '__main__':
         sim.save_current_figures()
         plt.close('all')
 
-        '''# --- PV loop overlays for ±10% parameter changes (this is what you're missing) ---
+        # --- PV loop overlays for ±10% parameter changes (this is what you're missing) ---
         sim.run_sensitivity_analysis(
             preload_params=('V_tot', 'C_sv', 'R_mv'),
             afterload_params=('R_sys', 'C_sa', 'Z_ao'),
@@ -3167,7 +3153,7 @@ if __name__ == '__main__':
             frac_drop=0.6,
             qc_plots=True  # <--- THIS triggers QC plotting
         )
-        sens_rows.extend(rows_sub)'''
+        sens_rows.extend(rows_sub)
 
         # ---- Full PV analysis report (single loop + occlusion-derived ESPVR/EDPVR/PRSW) ----
         report, family = sim.pv_full_report(sim.params, n_beats=8, frac_drop=0.6)

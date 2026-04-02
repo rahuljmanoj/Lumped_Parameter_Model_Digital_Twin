@@ -64,12 +64,12 @@ class SubjectSimulator:
         # Model parameter names and initial guess (for bounds)
         self.param_names = ['R_sys', 'Z_ao', 'C_sa', 'R_mv', 'E_max', 'E_min', 't_peak', 'V_tot', 'C_sv']
         self.params = {
-            'R_sys': 2.09, #'R_sys': data_row['R_sys'], #change here
-            'Z_ao': 0.06,  #'Z_ao': data_row['Z_ao'], #change here
-            'C_sa':0.68,   #'C_sa': data_row['C_sa'], #change here
+            'R_sys': 2.09, #'R_sys': data_row['R_sys'],#change here
+            'Z_ao': 0.06, #'Z_ao': data_row['Z_ao'],   #change here
+            'C_sa':0.68, #'C_sa': data_row['C_sa'],    #change here
             'R_mv': 0.05,
             'E_max': 5,
-            'E_min': 0.05, #'E_min': data_row['Emin_isotonic_cal'],  #'E_min': 0.05, #change here
+            'E_min': data_row['Emin_isotonic_cal'],   #'E_min': 0.05, #change here
             't_peak': 0.35,
             'V_tot': 300,
             'C_sv': 15,
@@ -77,12 +77,12 @@ class SubjectSimulator:
         }
         # Bounds for optimization (subject specific)
         self.bounds = [
-            (0.5, 4.0), #(self.params['R_sys'] * (1 - 0.20), self.params['R_sys'] * (1 + 0.20)), #change here
+            (0.5, 4.5),#(self.params['R_sys'] * (1 - 0.20), self.params['R_sys'] * (1 + 0.20)),  #change here
             (0.01, 1.0),#(self.params['Z_ao'] * (1 - 0.20), self.params['Z_ao'] * (1 + 0.20)), #change here
             (0.1, 10.0),#(self.params['C_sa'] * (1 - 0.20), self.params['C_sa'] * (1 + 0.20)), #change here
             (0.01, 0.1),     # R_mv
             (0.9, 10.0),     # E_max
-            (0.01, 2.5), #(self.params['E_min'] * (1 - 0.70), self.params['E_min'] * (1 + 0.70)),   #change here
+            (self.params['E_min'] * (1 - 0.70), self.params['E_min'] * (1 + 0.70)), #(0.01, 2.5),    #change here
             (0.1, 0.7),      # t_peak
             (50.0, 2000),    # V_tot
             (0.5, 30.0)      # C_sv
@@ -499,19 +499,19 @@ class SubjectSimulator:
         LVEDP_sim = mets['LVEDP']
 
         # --- LVEDP soft prior (MAP, absolute units; optional ±3 mmHg dead-zone) ---
-        LVEDP_pred = 1.7206 * self.SWE_velocity + 8.1086  # regression mean (your current model)
-        LVEDP_sim = mets['LVEDP']
+        #LVEDP_pred = 1.7206 * self.SWE_velocity + 8.1086  # regression mean (your current model)
+        #LVEDP_sim = mets['LVEDP']
 
-        delta = LVEDP_sim - LVEDP_pred
+        #delta = LVEDP_sim - LVEDP_pred
 
-        if self.use_prior_deadzone and abs(delta) <= self.prior_deadzone:
-            prior_penalty = 0.0
-        else:
-            eff = abs(delta) - (self.prior_deadzone if self.use_prior_deadzone else 0.0)
-            prior_penalty = (eff / self.sigma_prior) ** 2  # weight = 1/sigma_prior^2 (MAP)
+        #if self.use_prior_deadzone and abs(delta) <= self.prior_deadzone:
+        #    prior_penalty = 0.0
+        #else:
+        #    eff = abs(delta) - (self.prior_deadzone if self.use_prior_deadzone else 0.0)
+        #    prior_penalty = (eff / self.sigma_prior) ** 2  # weight = 1/sigma_prior^2 (MAP)
 
         # Optional kappa around MAP (kept at 1.0 by default)
-        sse += self.kappa_prior * prior_penalty
+        #sse += self.kappa_prior * prior_penalty
 
         # Penalize unphysiological LVEDP modified to hinge to bound method.
         L, U = 4.0, 35.0
@@ -822,12 +822,12 @@ if __name__ == '__main__':
 
     save_root = (
         r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin"
-        r"\3_Codes\Python\Data_Results\Results_Plots_Study_8_V4.1_T1"
+        r"\3_Codes\Python\Data_Results\Results_Plots_Study_10_V4.1_T4_without_regression"
     )
 
     # CHANGE V4: define output CSVs (incremental append)
-    results_path_final = os.path.join(save_root, "Study_8_V4.1_incremental.csv")
-    results_path_deonly = os.path.join(save_root, "Study_8_V4.1_DE_only.csv")
+    results_path_final = os.path.join(save_root, "Study_10_V4.1_incremental.csv")
+    results_path_deonly = os.path.join(save_root, "Study_10_V4.1_DE_only.csv")
     os.makedirs(save_root, exist_ok=True)
 
     sim_results = []

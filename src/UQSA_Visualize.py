@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
 # ====================== USER CONFIG ======================
-UQSA_ROOT = r".\Data_Results\Results_UQSA_LPM_4.1"   # <-- set to your SAVE_ROOT
+UQSA_ROOT = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Results_999_UQSA_LPM_4.1_without_regression"   # <-- set to your SAVE_ROOT
 SUB_ID    = 999
 PHYS_RANGE = (4.0, 35.0)       # mmHg
 MAX_SCATTER = 5000            # downsample cap for scatter

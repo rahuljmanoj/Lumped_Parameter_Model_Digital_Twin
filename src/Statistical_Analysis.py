@@ -36,9 +36,9 @@ from scipy.stats import pearsonr, ttest_rel, t, linregress
 # ============================== CONFIG =======================================
 
 # Paths
-FIG_SAVE_DIR = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Figure_Results_V4.1"
+FIG_SAVE_DIR = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Figure_Results_Test"
 EXCEL_PATH   = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx"
-SHEET_NAME   = "Study_3_V4.1_T6"
+SHEET_NAME   = "Study_9_V4.1_T7"
 HEADER_ROW   = 3
 NROWS        = 68
 
@@ -294,10 +294,10 @@ def plot_bland_altman(stats_dict, title="", x_label="Mean of methods",
     ax.fill_between([np.min(mean), np.max(mean)], ci_loa_high[0], ci_loa_high[1], alpha=0.08)
 
     style_axes(ax, x_label, y_label, add_legend=False)   # legend disabled
-    ax.set_xlim(5, 35)
-    ax.set_ylim(-15, 15)
-    ax.set_xticks(np.arange(5, 36, 5))
-    ax.set_yticks(np.arange(-15, 16, 5))
+    ax.set_xlim(5, 40)
+    ax.set_ylim(-20, 20)
+    ax.set_xticks(np.arange(5, 41, 5))
+    ax.set_yticks(np.arange(-20, 21, 5))
     fig.tight_layout()
 
     if save_path:

@@ -16,14 +16,14 @@ Author: Rahul Manoj (with Copilot assistance)
 
 # ======== USER SETTINGS ======================================================
 EXCEL_PATH   = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Data_Results\Results_Validation_Paper_all_subjects_V4.xlsx"
-SHEET_NAME   = "Study_3_V4.1_T6"     # adjust if needed
+SHEET_NAME   = "Study_9_V4.1_T7"     # adjust if needed
 #SUBJECT_LIST = [316, 319, 323, 325, 326, 327, 328, 329, 331, 332, 334, 336, 337, 338, 339, 341, 342, 343,
                 #344, 346, 347, 349, 351, 352]
 #SUBJECT_LIST =  [354, 356, 357, 359, 360]
-#SUBJECT_LIST =  [361, 362, 363, 364, 365,366, 367, 368, 369, 370]
+#SUBJECT_LIST =  [361, 362, 363, 364, 365,366, 367, 368, 369, 370, 371,372, 382, 383, 385, 386, 387, 388, 389, 390, 391, 392, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405,409, 410, 411, 412, 413,414, 415]
 
-SUBJECT_LIST =  [371, 372, 382, 383, 385, 386, 387, 388, 389, 390, 391, 392, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 409, 410, 411, 412, 413, 414, 415]                # 999 = mean row; or [316, 319, ...]
-SAVE_ROOT    = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Results_all_subjects_UQSA_LPM_4.1"
+SUBJECT_LIST =  [999]                # 999 = mean row; or [316, 319, ...]
+SAVE_ROOT    = r"C:\Workspace\Post_Doc_Works_NTNU\Projects\2_SWE_Velocity_LV_Filling_Pressure_Digital_Twin\3_Codes\Python\Results_999_UQSA_LPM_4.1_without_regression"
 
 # Monte-Carlo (UQ)
 N_MC     = 75000          # your requested 75k
